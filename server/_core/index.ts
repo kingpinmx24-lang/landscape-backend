@@ -43,7 +43,11 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Health check endpoint (required for Render deployment verification)
+  // Health check endpoints - both / and /health return 200 OK
+  // Render uses / by default for health checks
+  app.get("/", (_req, res) => {
+    res.json({ status: "ok", service: "landscape-backend", timestamp: new Date().toISOString() });
+  });
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
