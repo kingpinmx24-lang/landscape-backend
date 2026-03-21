@@ -110,12 +110,12 @@ export default function InventoryAdmin() {
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="max-w-7xl mx-auto space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 md:gap-0">
           <div>
-            <h1 className="text-3xl font-bold text-gray-900">Administración de Inventario</h1>
-            <p className="text-gray-600 mt-1">Gestiona tu catálogo de plantas</p>
+            <h1 className="text-2xl md:text-3xl font-bold text-gray-900">Administración de Inventario</h1>
+            <p className="text-sm md:text-base text-gray-600 mt-1">Gestiona tu catálogo de plantas</p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2 w-full md:w-auto">
             <Button onClick={handleExportCSV} variant="outline">
               <Download className="w-4 h-4 mr-2" />
               Exportar CSV

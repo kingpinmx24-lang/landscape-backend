@@ -4,203 +4,98 @@
  * Procedimientos tRPC para gestión de inventario y plantas
  */
 
-import { publicProcedure, router } from "../_core/trpc";
+import { protectedProcedure, publicProcedure, router } from "../_core/trpc";
+import { TRPCError } from "@trpc/server";
 import { z } from "zod";
+import { inventoryItems } from "../../drizzle/schema";
+import { getDb } from "../db";
+import { eq } from "drizzle-orm";
 
 /**
  * Validación de planta
  */
 const PlantSchema = z.object({
-  id: z.string().optional(),
-  name: z.string().min(1),
+  name: z.string().min(1, "Name is required"),
   scientificName: z.string().optional(),
   type: z.enum(["tree", "shrub", "flower", "grass", "groundcover"]),
-  price: z.number().positive(),
-  stock: z.number().nonnegative(),
-  minStock: z.number().nonnegative(),
-  imageUrl: z.string().url().optional(),
+  price: z.number().positive("Price must be positive"),
+  stock: z.number().int().min(0, "Stock cannot be negative"),
+  minStock: z.number().int().min(0, "Min stock cannot be negative"),
+  imageUrl: z.string().url("Invalid image URL").optional(),
   description: z.string().optional(),
   climate: z.string().optional(),
   lightRequirement: z.enum(["full", "partial", "shade"]).optional(),
   waterRequirement: z.enum(["low", "medium", "high"]).optional(),
-  matureHeight: z.number().optional(),
-  matureWidth: z.number().optional(),
-  minSpacing: z.number().optional(),
+  matureHeight: z.number().positive("Mature height must be positive").optional(),
+  matureWidth: z.number().positive("Mature width must be positive").optional(),
+  minSpacing: z.number().positive("Min spacing must be positive").optional(),
 });
 
 /**
  * Router de inventario
  */
 export const inventoryRouter = router({
-  /**
-   * Obtener todas las plantas del inventario
-   */
-  getAll: publicProcedure.query(async () => {
-    // En producción, consultar base de datos
-    // Por ahora, retornar datos de ejemplo
-    return [
-      {
-        id: "plant-1",
-        name: "Rose",
-        scientificName: "Rosa spp.",
-        type: "flower",
-        price: 15.0,
-        stock: 50,
-        minStock: 10,
-        imageUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
-        description: "Beautiful red roses",
-        climate: "temperate",
-        lightRequirement: "full",
-        waterRequirement: "medium",
-        matureHeight: 1.5,
-        matureWidth: 1.0,
-        minSpacing: 0.5,
-      },
-      {
-        id: "plant-2",
-        name: "Oak Tree",
-        scientificName: "Quercus spp.",
-        type: "tree",
-        price: 120.0,
-        stock: 15,
-        minStock: 5,
-        imageUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
-        description: "Majestic oak tree",
-        climate: "temperate",
-        lightRequirement: "full",
-        waterRequirement: "medium",
-        matureHeight: 20,
-        matureWidth: 15,
-        minSpacing: 5,
-      },
-    ];
+  list: publicProcedure.query(async () => {
+    const db = await getDb();
+    if (!db) {
+      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
+    }
+    return db.select().from(inventoryItems);
   }),
 
-  /**
-   * Obtener planta por ID\n   */
-  getById: publicProcedure
-    .input(z.object({ id: z.string() }))
-    .query(async ({ input }) => {
-      // En producción, consultar base de datos
-      return null;
-    }),
+  add: protectedProcedure.input(PlantSchema).mutation(async ({ input }) => {
+    const db = await getDb();
+    if (!db) {
+      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
+    }
+    const [newPlant] = await db.insert(inventoryItems).values(input).returning();
+    return newPlant;
+  }),
 
-  /**
-   * Crear nueva planta
-   */
-  create: publicProcedure
-    .input(PlantSchema)
-    .mutation(async ({ input }) => {
-      // En producción:
-      // 1. Validar datos
-      // 2. Guardar en base de datos
-      // 3. Retornar planta creada
-      const newPlant = {
-        id: `plant-${Date.now()}`,
-        ...input,
-      };
-      return newPlant;
-    }),
+  update: protectedProcedure.input(PlantSchema.extend({ id: z.number() })).mutation(async ({ input }) => {
+    const db = await getDb();
+    if (!db) {
+      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
+    }
+    const { id, ...data } = input;
+    const [updatedPlant] = await db.update(inventoryItems).set(data).where(eq(inventoryItems.id, id)).returning();
+    return updatedPlant;
+  }),
 
-  /**
-   * Actualizar planta
-   */
-  update: publicProcedure
-    .input(
-      PlantSchema.extend({
-        id: z.string(),
-      })
-    )
-    .mutation(async ({ input }) => {
-      // En producción:
-      // 1. Validar que existe
-      // 2. Actualizar en base de datos
-      // 3. Retornar planta actualizada
-      return input;
-    }),
+  delete: protectedProcedure.input(z.object({ id: z.number() })).mutation(async ({ input }) => {
+    const db = await getDb();
+    if (!db) {
+      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
+    }
+    await db.delete(inventoryItems).where(eq(inventoryItems.id, input.id));
+    return { success: true };
+  }),
 
-  /**
-   * Eliminar planta
-   */
-  delete: publicProcedure
-    .input(z.object({ id: z.string() }))
-    .mutation(async ({ input }) => {
-      // En producción:
-      // 1. Validar que existe
-      // 2. Eliminar de base de datos
-      // 3. Retornar confirmación
-      return { success: true, id: input.id };
-    }),
+  uploadImage: protectedProcedure.input(z.object({
+    fileData: z.string(), // Base64 encoded
+    mimeType: z.string(),
+  })).mutation(async ({ input }) => {
+    const imageUrl = `data:${input.mimeType};base64,${input.fileData}`;
+    return { imageUrl };
+  }),
 
-  /**
-   * Actualizar stock de planta
-   */
-  updateStock: publicProcedure
-    .input(
-      z.object({
-        id: z.string(),
-        quantity: z.number(), // Positivo para agregar, negativo para restar
-      })
-    )
-    .mutation(async ({ input }) => {
-      // En producción:
-      // 1. Obtener planta
-      // 2. Actualizar stock
-      // 3. Retornar nuevo stock
-      return { success: true, newStock: 0 };
-    }),
-
-  /**
-   * Subir imagen de planta
-   */
-  uploadImage: publicProcedure
-    .input(
-      z.object({
-        fileName: z.string(),
-        fileData: z.string(), // Base64 encoded
-        mimeType: z.string(),
-      })
-    )
-    .mutation(async ({ input }) => {
-      // En producción:
-      // 1. Validar tipo de archivo (PNG, JPG, WebP)
-      // 2. Validar tamaño (<5MB)
-      // 3. Subir a S3
-      // 4. Retornar URL pública
-      const imageUrl = `https://cdn.example.com/plants/${input.fileName}`;
-      return { success: true, imageUrl };
-    }),
-
-  /**
-   * Eliminar imagen de planta
-   */
-  deleteImage: publicProcedure
-    .input(z.object({ imageUrl: z.string() }))
-    .mutation(async ({ input }) => {
-      // En producción:
-      // 1. Eliminar de S3
-      // 2. Retornar confirmación
-      return { success: true };
-    }),
-
-  /**
-   * Buscar plantas por criterios
-   */
-  search: publicProcedure
-    .input(
-      z.object({
-        query: z.string().optional(),
-        type: z.string().optional(),
-        minPrice: z.number().optional(),
-        maxPrice: z.number().optional(),
-        climate: z.string().optional(),
-      })
-    )
-    .query(async ({ input }) => {
-      // En producción:
-      // 1. Construir query con filtros
-      // 2. Consultar base de datos
-      // 3. Retornar resultados
-      return [];
-    }),
+  updateStock: protectedProcedure.input(z.object({
+    id: z.number(),
+    quantity: z.number(), // positive = add, negative = subtract
+  })).mutation(async ({ input }) => {
+    const db = await getDb();
+    if (!db) {
+      throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
+    }
+    const [item] = await db.select().from(inventoryItems).where(eq(inventoryItems.id, input.id));
+    if (!item) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "Item not found" });
+    }
+    const newStock = Math.max(0, item.stock + input.quantity);
+    const [updated] = await db.update(inventoryItems)
+      .set({ stock: newStock })
+      .where(eq(inventoryItems.id, input.id))
+      .returning();
+    return updated;
+  }),
 });

@@ -68,17 +68,18 @@ export default function NewProject() {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       {/* Header */}
       <header className="bg-white border-b border-gray-200">
-        <div className="max-w-4xl mx-auto px-4 py-6 flex items-center gap-4">
+        <div className="max-w-4xl mx-auto px-4 py-4 md:py-6 flex items-center gap-2 md:gap-4">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => window.history.back()}
+            className="shrink-0"
           >
             <ArrowLeft className="w-4 h-4" />
           </Button>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">Nuevo Proyecto</h1>
-            <p className="text-sm text-gray-600">Crea un nuevo proyecto de paisajismo</p>
+            <h1 className="text-xl md:text-2xl font-bold text-gray-900">Nuevo Proyecto</h1>
+            <p className="text-xs md:text-sm text-gray-600">Crea un nuevo proyecto de paisajismo</p>
           </div>
         </div>
       </header>

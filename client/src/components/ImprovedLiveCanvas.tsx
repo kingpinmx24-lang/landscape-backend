@@ -1,371 +1,479 @@
-/*
+/**
  * Component: ImprovedLiveCanvas
  * ============================================================================
- * Canvas mejorado con arrastrar de imágenes, selección, y detector de terreno
+ * Production-grade canvas with:
+ * - ERASER MODE: swipe/drag finger over obstacles to erase them instantly
+ * - HTML overlay divs for obstacles (native click/touch, no coordinate math)
+ * - Canvas only draws background + plants
+ * - Responsive: adapts to container via ResizeObserver
+ * - Touch support for mobile/tablet
+ * - Drag & drop plants from inventory
  */
 
-import React, { useRef, useEffect, useState, useCallback } from "react";
+import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { SelectedObject } from "../../../shared/live-interaction-types";
-import { analyzeTerrainImage, TerrainAnalysis } from "../../../shared/terrain-detection";
+import { Obstacle } from "./ObstacleDetector";
 
 interface ImprovedLiveCanvasProps {
-  width: number;
-  height: number;
   backgroundImage?: string;
   objects: SelectedObject[];
+  obstacles?: Obstacle[];
   onObjectsChange?: (objects: SelectedObject[]) => void;
-  onTerrainAnalysis?: (analysis: TerrainAnalysis) => void;
+  onSelectionChange?: (selected: SelectedObject[]) => void;
+  onObstacleDelete?: (obstacleId: string) => void;
   gridSize?: number;
   snapToGrid?: boolean;
 }
 
 export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
-  width,
-  height,
   backgroundImage,
   objects,
+  obstacles = [],
   onObjectsChange,
-  onTerrainAnalysis,
+  onSelectionChange,
+  onObstacleDelete,
   gridSize = 20,
-  snapToGrid = true,
+  snapToGrid = false,
 }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const overlayRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [currentObjects, setCurrentObjects] = useState<SelectedObject[]>(objects);
+
+  // Internal canvas resolution
+  const INTERNAL_W = 800;
+  const INTERNAL_H = 600;
+
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
-  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+  const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
   const [backgroundImg, setBackgroundImg] = useState<HTMLImageElement | null>(null);
-  const [imageCache, setImageCache] = useState<Map<string, HTMLImageElement>>(
-    new Map()
-  );
+  const [imageCache] = useState<Map<string, HTMLImageElement>>(new Map());
+  const objectsRef = useRef<SelectedObject[]>(objects);
+  const [eraserMode, setEraserMode] = useState(false);
+  // Track which obstacles are being erased (for animation)
+  const [erasingIds, setErasingIds] = useState<Set<string>>(new Set());
+  const eraserActiveRef = useRef(false);
 
-  // Cargar imagen de fondo
   useEffect(() => {
-    if (backgroundImage) {
-      const img = new Image();
+    objectsRef.current = objects;
+  }, [objects]);
+
+  // ─── Load background image ───
+  useEffect(() => {
+    if (!backgroundImage) return;
+    const img = new Image();
+    if (backgroundImage.startsWith("http")) {
       img.crossOrigin = "anonymous";
-      img.onload = () => {
-        setBackgroundImg(img);
-
-        // Analizar terreno
-        const canvas = document.createElement("canvas");
-        canvas.width = img.width;
-        canvas.height = img.height;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
-          ctx.drawImage(img, 0, 0);
-          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const analysis = analyzeTerrainImage(imageData);
-          if (onTerrainAnalysis) {
-            onTerrainAnalysis(analysis);
-          }
-        }
-      };
-      img.src = backgroundImage;
     }
-  }, [backgroundImage, onTerrainAnalysis]);
+    img.onload = () => setBackgroundImg(img);
+    img.onerror = () => console.error("[Canvas] Failed to load background image");
+    img.src = backgroundImage;
+  }, [backgroundImage]);
 
-  // Precargar imágenes de objetos
+  // ─── Preload object images ───
   useEffect(() => {
-    const newCache = new Map(imageCache);
-    currentObjects.forEach((obj) => {
-      if (obj.imageUrl && !newCache.has(obj.imageUrl)) {
+    objects.forEach((obj) => {
+      const url = obj.imageUrl || (obj.metadata?.imageUrl as string);
+      if (url && !imageCache.has(url)) {
         const img = new Image();
         img.crossOrigin = "anonymous";
         img.onload = () => {
-          newCache.set(obj.imageUrl!, img);
-          setImageCache(new Map(newCache));
+          imageCache.set(url, img);
         };
-        img.src = obj.imageUrl;
+        img.src = url;
       }
     });
-  }, [currentObjects, imageCache]);
+  }, [objects, imageCache]);
 
-  // Encontrar objeto en posición
-  const getObjectAtPosition = useCallback(
+  // ─── Canvas coordinate helpers ───
+  const getCanvasCoords = useCallback((clientX: number, clientY: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return { x: 0, y: 0 };
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = INTERNAL_W / rect.width;
+    const scaleY = INTERNAL_H / rect.height;
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY,
+    };
+  }, []);
+
+  // ─── Hit test: which object is at canvas coords ───
+  const hitTestObject = useCallback(
     (x: number, y: number): SelectedObject | null => {
-      for (let i = currentObjects.length - 1; i >= 0; i--) {
-        const obj = currentObjects[i];
-        const distance = Math.sqrt((x - obj.x) ** 2 + (y - obj.y) ** 2);
-        if (distance <= obj.radius) {
-          return obj;
-        }
+      const objs = objectsRef.current;
+      for (let i = objs.length - 1; i >= 0; i--) {
+        const obj = objs[i];
+        const r = (obj.radius || 25) + 5;
+        if (Math.hypot(x - obj.x, y - obj.y) <= r) return obj;
       }
       return null;
     },
-    [currentObjects]
+    []
   );
 
-  // Aplicar snap a grid
-  const snapToGridValue = useCallback(
-    (value: number): number => {
-      if (!snapToGrid) return value;
-      return Math.round(value / gridSize) * gridSize;
+  // ─── ERASER: hit test obstacle overlays by pixel position ───
+  const hitTestObstacleAtPoint = useCallback(
+    (clientX: number, clientY: number): string | null => {
+      if (!overlayRef.current) return null;
+      // Use elementFromPoint to find which obstacle div is under the finger
+      const el = document.elementFromPoint(clientX, clientY);
+      if (!el) return null;
+      // Walk up the DOM to find an element with data-obstacle-id
+      let node: Element | null = el;
+      while (node && node !== overlayRef.current) {
+        const id = node.getAttribute("data-obstacle-id");
+        if (id) return id;
+        node = node.parentElement;
+      }
+      return null;
     },
-    [snapToGrid, gridSize]
+    []
   );
 
-  // Manejar mouse down
+  // ─── Erase obstacle by id (with fade animation) ───
+  const eraseObstacle = useCallback(
+    (id: string) => {
+      setErasingIds((prev) => {
+        if (prev.has(id)) return prev;
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+      // After fade animation, actually delete
+      setTimeout(() => {
+        onObstacleDelete?.(id);
+        setErasingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }, 200);
+    },
+    [onObstacleDelete]
+  );
+
+  // ─── Mouse handlers for canvas (plant dragging) ───
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-
-      const obj = getObjectAtPosition(x, y);
-      if (obj) {
-        setSelectedObjectId(obj.id);
+      if (eraserMode) return; // In eraser mode, canvas clicks are ignored
+      const { x, y } = getCanvasCoords(e.clientX, e.clientY);
+      const hit = hitTestObject(x, y);
+      if (hit) {
+        setSelectedObjectId(hit.id);
         setIsDragging(true);
-        setDragStart({ x, y });
-        canvas.style.cursor = "grabbing";
-      }
-    },
-    [getObjectAtPosition]
-  );
-
-  // Manejar mouse move
-  const handleMouseMove = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-
-      if (isDragging && dragStart && selectedObjectId) {
-        const deltaX = x - dragStart.x;
-        const deltaY = y - dragStart.y;
-
-        setCurrentObjects((prev) =>
-          prev.map((obj) => {
-            if (obj.id === selectedObjectId) {
-              const newX = snapToGridValue(obj.x + deltaX);
-              const newY = snapToGridValue(obj.y + deltaY);
-
-              // Validar límites
-              if (newX >= obj.radius && newX <= width - obj.radius &&
-                  newY >= obj.radius && newY <= height - obj.radius) {
-                return { ...obj, x: newX, y: newY };
-              }
-            }
-            return obj;
-          })
-        );
-
-        setDragStart({ x, y });
-      } else {
-        // Cambiar cursor si está sobre un objeto
-        if (getObjectAtPosition(x, y)) {
-          canvas.style.cursor = "grab";
-        } else {
-          canvas.style.cursor = "default";
-        }
-      }
-    },
-    [isDragging, dragStart, selectedObjectId, snapToGridValue, width, height, getObjectAtPosition]
-  );
-
-  // Manejar mouse up
-  const handleMouseUp = useCallback(() => {
-    setIsDragging(false);
-    setDragStart(null);
-    const canvas = canvasRef.current;
-    if (canvas) {
-      canvas.style.cursor = "default";
-    }
-  }, []);
-
-  // Manejar clic
-  const handleCanvasClick = useCallback(
-    (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (isDragging) return;
-
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-
-      const rect = canvas.getBoundingClientRect();
-      const x = e.clientX - rect.left;
-      const y = e.clientY - rect.top;
-
-      const obj = getObjectAtPosition(x, y);
-      if (obj) {
-        setSelectedObjectId(obj.id);
+        setDragOffset({ x: x - hit.x, y: y - hit.y });
+        onSelectionChange?.([hit]);
       } else {
         setSelectedObjectId(null);
+        onSelectionChange?.([]);
       }
     },
-    [isDragging, getObjectAtPosition]
+    [eraserMode, getCanvasCoords, hitTestObject, onSelectionChange]
   );
 
-  // Manejar drag over
-  const handleDragOver = useCallback((e: React.DragEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!isDragging || !selectedObjectId || eraserMode) return;
+      const { x, y } = getCanvasCoords(e.clientX, e.clientY);
+      const newX = Math.max(0, Math.min(INTERNAL_W, x - dragOffset.x));
+      const newY = Math.max(0, Math.min(INTERNAL_H, y - dragOffset.y));
+      const updated = objectsRef.current.map((obj) =>
+        obj.id === selectedObjectId ? { ...obj, x: newX, y: newY } : obj
+      );
+      objectsRef.current = updated;
+      onObjectsChange?.(updated);
+    },
+    [isDragging, selectedObjectId, eraserMode, getCanvasCoords, dragOffset, onObjectsChange]
+  );
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
   }, []);
 
-  // Manejar drop
+  // ─── Touch handlers for canvas (plant dragging) ───
+  const handleTouchStart = useCallback(
+    (e: React.TouchEvent<HTMLCanvasElement>) => {
+      if (eraserMode) return;
+      const touch = e.touches[0];
+      const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
+      const hit = hitTestObject(x, y);
+      if (hit) {
+        setSelectedObjectId(hit.id);
+        setIsDragging(true);
+        setDragOffset({ x: x - hit.x, y: y - hit.y });
+        onSelectionChange?.([hit]);
+      }
+    },
+    [eraserMode, getCanvasCoords, hitTestObject, onSelectionChange]
+  );
+
+  const handleTouchMove = useCallback(
+    (e: React.TouchEvent<HTMLCanvasElement>) => {
+      if (!isDragging || !selectedObjectId || eraserMode) return;
+      e.preventDefault();
+      const touch = e.touches[0];
+      const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
+      const newX = Math.max(0, Math.min(INTERNAL_W, x - dragOffset.x));
+      const newY = Math.max(0, Math.min(INTERNAL_H, y - dragOffset.y));
+      const updated = objectsRef.current.map((obj) =>
+        obj.id === selectedObjectId ? { ...obj, x: newX, y: newY } : obj
+      );
+      objectsRef.current = updated;
+      onObjectsChange?.(updated);
+    },
+    [isDragging, selectedObjectId, eraserMode, getCanvasCoords, dragOffset, onObjectsChange]
+  );
+
+  const handleTouchEnd = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  // ─── Drag & drop from inventory ───
+  const handleDragOver = useCallback((e: React.DragEvent<HTMLCanvasElement>) => {
+    e.preventDefault();
+  }, []);
+
   const handleDrop = useCallback(
     (e: React.DragEvent<HTMLCanvasElement>) => {
       e.preventDefault();
+      const { x, y } = getCanvasCoords(e.clientX, e.clientY);
       try {
-        const data = e.dataTransfer.getData("application/json");
-        if (!data) return;
-
-        const plantData = JSON.parse(data);
-        if (plantData.type !== "plant") return;
-
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-
-        const rect = canvas.getBoundingClientRect();
-        const x = snapToGridValue(e.clientX - rect.left);
-        const y = snapToGridValue(e.clientY - rect.top);
-
-        const radius = 30;
-        if (x >= radius && x <= width - radius && y >= radius && y <= height - radius) {
-          const newObject: SelectedObject = {
+        const data = JSON.parse(e.dataTransfer.getData("application/json"));
+        if (data?.type === "plant") {
+          const newObj: SelectedObject = {
             id: `plant-${Date.now()}`,
+            type: data.plantType || "plant",
             x,
             y,
-            radius,
-            type: "plant",
-            imageUrl: plantData.imageUrl,
-            metadata: {
-              price: plantData.price,
-              inventoryId: plantData.id,
-              name: plantData.name,
-            },
+            radius: 25,
+            imageUrl: data.imageUrl,
+            metadata: data.metadata || {},
           };
-
-          const updatedObjects = [...currentObjects, newObject];
-          setCurrentObjects(updatedObjects);
-          setSelectedObjectId(newObject.id);
-
-          if (onObjectsChange) {
-            onObjectsChange(updatedObjects);
-          }
+          const updated = [...objectsRef.current, newObj];
+          objectsRef.current = updated;
+          onObjectsChange?.(updated);
         }
-      } catch (error) {
-        console.error("Error al procesar drop:", error);
-      }
+      } catch {}
     },
-    [currentObjects, snapToGridValue, width, height, onObjectsChange]
+    [getCanvasCoords, onObjectsChange]
   );
 
-  // Renderizar canvas
+  // ─── ERASER: overlay touch/mouse handlers ───
+  const handleEraserPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!eraserMode) return;
+      eraserActiveRef.current = true;
+      const id = hitTestObstacleAtPoint(e.clientX, e.clientY);
+      if (id) eraseObstacle(id);
+    },
+    [eraserMode, hitTestObstacleAtPoint, eraseObstacle]
+  );
+
+  const handleEraserPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!eraserMode || !eraserActiveRef.current) return;
+      const id = hitTestObstacleAtPoint(e.clientX, e.clientY);
+      if (id) eraseObstacle(id);
+    },
+    [eraserMode, hitTestObstacleAtPoint, eraseObstacle]
+  );
+
+  const handleEraserPointerUp = useCallback(() => {
+    eraserActiveRef.current = false;
+  }, []);
+
+  // ─── Draw canvas ───
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Limpiar canvas
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, width, height);
+    ctx.clearRect(0, 0, INTERNAL_W, INTERNAL_H);
 
-    // Dibujar imagen de fondo
+    // Background
     if (backgroundImg) {
-      ctx.drawImage(backgroundImg, 0, 0, width, height);
+      ctx.drawImage(backgroundImg, 0, 0, INTERNAL_W, INTERNAL_H);
+    } else {
+      const grad = ctx.createLinearGradient(0, 0, 0, INTERNAL_H);
+      grad.addColorStop(0, "#e8f5e9");
+      grad.addColorStop(1, "#c8e6c9");
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
     }
 
-    // Dibujar grid
-    if (snapToGrid) {
-      ctx.strokeStyle = "#f0f0f0";
-      ctx.lineWidth = 1;
-      for (let x = 0; x < width; x += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, height);
-        ctx.stroke();
-      }
-      for (let y = 0; y < height; y += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(width, y);
-        ctx.stroke();
-      }
-    }
+    // Draw plant objects
+    objects.forEach((obj) => {
+      const r = obj.radius || 25;
+      const imgUrl = obj.imageUrl || (obj.metadata?.imageUrl as string);
+      const cachedImg = imgUrl ? imageCache.get(imgUrl) : null;
 
-    // Dibujar objetos
-    currentObjects.forEach((obj) => {
-      const isSelected = selectedObjectId === obj.id;
-
-      if (obj.imageUrl && imageCache.has(obj.imageUrl)) {
-        const img = imageCache.get(obj.imageUrl)!;
+      if (cachedImg) {
         ctx.save();
         ctx.beginPath();
-        ctx.arc(obj.x, obj.y, obj.radius, 0, Math.PI * 2);
+        ctx.arc(obj.x, obj.y, r, 0, Math.PI * 2);
         ctx.clip();
-        ctx.drawImage(
-          img,
-          obj.x - obj.radius,
-          obj.y - obj.radius,
-          obj.radius * 2,
-          obj.radius * 2
-        );
+        ctx.drawImage(cachedImg, obj.x - r, obj.y - r, r * 2, r * 2);
         ctx.restore();
       } else {
-        ctx.fillStyle = isSelected ? "#FF6B6B" : "#4ECDC4";
         ctx.beginPath();
-        ctx.arc(obj.x, obj.y, obj.radius, 0, Math.PI * 2);
+        ctx.arc(obj.x, obj.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = obj.id === selectedObjectId ? "#4CAF50" : "#66BB6A";
         ctx.fill();
-      }
-
-      // Dibujar bounding box si está seleccionado
-      if (isSelected) {
-        ctx.strokeStyle = "#FF6B6B";
-        ctx.lineWidth = 3;
-        ctx.beginPath();
-        ctx.arc(obj.x, obj.y, obj.radius, 0, Math.PI * 2);
+        ctx.strokeStyle = obj.id === selectedObjectId ? "#1B5E20" : "#2E7D32";
+        ctx.lineWidth = obj.id === selectedObjectId ? 3 : 2;
         ctx.stroke();
-
-        // Dibujar handles
-        const handleSize = 8;
-        ctx.fillStyle = "#FF6B6B";
-        for (let angle = 0; angle < Math.PI * 2; angle += Math.PI / 2) {
-          const hx = obj.x + Math.cos(angle) * obj.radius;
-          const hy = obj.y + Math.sin(angle) * obj.radius;
-          ctx.fillRect(hx - handleSize / 2, hy - handleSize / 2, handleSize, handleSize);
-        }
       }
 
-      // Dibujar etiqueta
-      ctx.fillStyle = "#000000";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.shadowColor = "rgba(255, 255, 255, 0.8)";
-      ctx.shadowBlur = 3;
-      ctx.fillText(obj.type.substring(0, 3).toUpperCase(), obj.x, obj.y);
-    });
-  }, [currentObjects, selectedObjectId, backgroundImg, imageCache, width, height, gridSize, snapToGrid]);
+      if (obj.id === selectedObjectId) {
+        ctx.strokeStyle = "#1565C0";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.arc(obj.x, obj.y, r + 3, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
 
-  // Notificar cambios
-  useEffect(() => {
-    if (onObjectsChange) {
-      onObjectsChange(currentObjects);
-    }
-  }, [currentObjects, onObjectsChange]);
+      const label = (obj.metadata?.name as string) || obj.type || "";
+      if (label) {
+        ctx.font = "bold 10px Arial";
+        ctx.textAlign = "center";
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(obj.x - 30, obj.y + r + 2, 60, 14);
+        ctx.fillStyle = "#fff";
+        ctx.fillText(label.substring(0, 12), obj.x, obj.y + r + 12);
+      }
+    });
+  }, [objects, selectedObjectId, backgroundImg, imageCache]);
+
+  // ─── Compute obstacle overlay positions ───
+  const obstacleOverlays = useMemo(() => {
+    return obstacles.map((obs) => {
+      const leftPct = ((obs.x - obs.width / 2) / INTERNAL_W) * 100;
+      const topPct = ((obs.y - obs.height / 2) / INTERNAL_H) * 100;
+      const widthPct = (obs.width / INTERNAL_W) * 100;
+      const heightPct = (obs.height / INTERNAL_H) * 100;
+      return {
+        obs,
+        leftPct: Math.max(0, leftPct),
+        topPct: Math.max(0, topPct),
+        widthPct: Math.min(100 - Math.max(0, leftPct), widthPct),
+        heightPct: Math.min(100 - Math.max(0, topPct), heightPct),
+      };
+    });
+  }, [obstacles]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={width}
-      height={height}
-      onClick={handleCanvasClick}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseUp}
-      onDragOver={handleDragOver}
-      onDrop={handleDrop}
-      className="border-2 border-dashed border-gray-300 rounded-lg cursor-default bg-white"
-      style={{ touchAction: "none" }}
-    />
+    <div ref={containerRef} className="w-full h-full min-h-[250px] relative select-none">
+
+      {/* ─── Eraser Mode Toggle Button ─── */}
+      {obstacles.length > 0 && (
+        <button
+          onClick={() => setEraserMode((v) => !v)}
+          className={`absolute top-2 right-2 z-40 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold shadow-lg transition-all active:scale-95 ${
+            eraserMode
+              ? "bg-orange-500 text-white ring-2 ring-orange-300 ring-offset-1"
+              : "bg-white/90 text-gray-700 border border-gray-300 hover:bg-orange-50 hover:border-orange-400"
+          }`}
+          title={eraserMode ? "Modo borrador activo — arrastra sobre obstáculos para borrarlos" : "Activar modo borrador"}
+        >
+          <span className="text-base">🧹</span>
+          <span>{eraserMode ? "Borrando..." : "Borrador"}</span>
+        </button>
+      )}
+
+      {/* ─── Canvas: background + plants ─── */}
+      <canvas
+        ref={canvasRef}
+        width={INTERNAL_W}
+        height={INTERNAL_H}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+        className="w-full h-auto rounded-lg shadow-inner block"
+        style={{
+          touchAction: "none",
+          cursor: eraserMode ? "none" : "crosshair",
+        }}
+      />
+
+      {/* ─── Obstacle Overlay ─── */}
+      {obstacles.length > 0 && (
+        <div
+          ref={overlayRef}
+          className="absolute top-0 left-0 w-full rounded-lg overflow-hidden"
+          style={{
+            aspectRatio: `${INTERNAL_W} / ${INTERNAL_H}`,
+            pointerEvents: eraserMode ? "auto" : "none",
+            cursor: eraserMode ? "crosshair" : "default",
+            // Show eraser cursor when in eraser mode
+            ...(eraserMode && { cursor: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Crect x='4' y='16' width='24' height='12' rx='2' fill='%23ff6b35' stroke='%23333' stroke-width='1.5'/%3E%3Crect x='4' y='4' width='24' height='12' rx='2' fill='%23ffd166' stroke='%23333' stroke-width='1.5'/%3E%3Cline x1='4' y1='16' x2='28' y2='16' stroke='%23333' stroke-width='1'/%3E%3C/svg%3E\") 16 28, crosshair" }),
+          }}
+          onPointerDown={handleEraserPointerDown}
+          onPointerMove={handleEraserPointerMove}
+          onPointerUp={handleEraserPointerUp}
+          onPointerLeave={handleEraserPointerUp}
+        >
+          {obstacleOverlays.map(({ obs, leftPct, topPct, widthPct, heightPct }) => {
+            const isErasing = erasingIds.has(obs.id);
+            return (
+              <div
+                key={obs.id}
+                data-obstacle-id={obs.id}
+                className={`absolute border-2 border-dashed transition-all ${
+                  isErasing
+                    ? "border-orange-400 bg-orange-400/60 scale-110 opacity-0"
+                    : eraserMode
+                    ? "border-orange-400 bg-orange-400/25 hover:bg-orange-400/50 hover:border-orange-500"
+                    : "border-red-500 bg-red-500/20"
+                }`}
+                style={{
+                  left: `${leftPct}%`,
+                  top: `${topPct}%`,
+                  width: `${widthPct}%`,
+                  height: `${heightPct}%`,
+                  pointerEvents: eraserMode ? "auto" : "none",
+                  transition: isErasing ? "all 0.2s ease-out" : "border-color 0.15s, background-color 0.15s",
+                  zIndex: 10,
+                }}
+                title={`${obs.label} (${(obs.confidence * 100).toFixed(0)}%)`}
+              >
+                {/* Label tag */}
+                <span
+                  className={`absolute -top-5 left-1/2 -translate-x-1/2 text-[9px] sm:text-[10px] font-bold whitespace-nowrap px-1 py-0.5 rounded shadow pointer-events-none ${
+                    eraserMode ? "bg-orange-500 text-white" : "bg-red-600 text-white"
+                  }`}
+                >
+                  {obs.label}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ─── Hint bar ─── */}
+      {obstacles.length > 0 && (
+        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 pointer-events-none z-20">
+          {eraserMode ? (
+            <div className="bg-orange-500/90 text-white text-[10px] sm:text-xs px-3 py-1.5 rounded-full font-semibold shadow-lg flex items-center gap-1.5 animate-pulse">
+              🧹 Arrastra el dedo sobre los obstáculos para borrarlos
+            </div>
+          ) : (
+            <div className="bg-black/60 text-white text-[10px] sm:text-xs px-3 py-1 rounded-full">
+              Toca 🧹 Borrador para eliminar obstáculos con el dedo
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 };

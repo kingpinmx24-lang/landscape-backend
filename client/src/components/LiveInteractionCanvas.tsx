@@ -11,6 +11,7 @@ import { SelectedObject, MoveData } from "../../../shared/live-interaction-types
 interface LiveInteractionCanvasProps {
   width: number;
   height: number;
+  backgroundImage?: string;
   objects: SelectedObject[];
   onObjectsChange?: (objects: SelectedObject[]) => void;
   onSelectionChange?: (selected: SelectedObject[]) => void;
@@ -26,6 +27,7 @@ interface LiveInteractionCanvasProps {
 export const LiveInteractionCanvas: React.FC<LiveInteractionCanvasProps> = ({
   width,
   height,
+  backgroundImage,
   objects,
   onObjectsChange,
   onSelectionChange,
@@ -43,6 +45,7 @@ export const LiveInteractionCanvas: React.FC<LiveInteractionCanvasProps> = ({
     updateDrag,
     endDrag,
     moveObject,
+    deleteObject,
     showFloatingControls,
     hideFloatingControls,
   } = useLiveInteraction({
@@ -210,6 +213,36 @@ export const LiveInteractionCanvas: React.FC<LiveInteractionCanvasProps> = ({
   /**
    * Manejar mouse up para finalizar arrastre
    */
+  /**
+   * Manejar teclas (Eliminar)
+   */
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Delete" || e.key === "Backspace") {
+        if (state.selectedObjects.length > 0) {
+          // Asumimos que se puede eliminar el primero seleccionado
+          const objToDelete = state.selectedObjects[0];
+          deleteObject({ id: objToDelete.id } as any);
+          hideFloatingControls();
+          
+          // La eliminación se maneja a través del hook useLiveInteraction, 
+          // pero necesitamos notificar al padre a través de onObjectsChange
+          // o depender de que el padre escuche los cambios de selectedObjects y 
+          // maneje la eliminación a través de FloatingControls o similar.
+          // Para asegurar la sincronización con designSync, vamos a forzar la actualización:
+          if (onObjectsChange) {
+             const newObjects = currentObjects.filter(obj => obj.id !== objToDelete.id);
+             setCurrentObjects(newObjects);
+             onObjectsChange(newObjects);
+          }
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [state.selectedObjects, deleteObject, hideFloatingControls]);
+
   const handleMouseUp = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
       if (!state.isDragging || !draggedObjectRef.current) return;
@@ -255,12 +288,34 @@ export const LiveInteractionCanvas: React.FC<LiveInteractionCanvasProps> = ({
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
-    // Limpiar canvas
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, width, height);
+    // Función principal de renderizado
+    const render = () => {
+      // Limpiar canvas
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, width, height);
 
-    // Dibujar grid
-    if (snapToGrid) {
+      // Dibujar imagen de fondo si existe
+      if (backgroundImage) {
+        const img = new Image();
+        img.src = backgroundImage;
+        img.onload = () => {
+          ctx.drawImage(img, 0, 0, width, height);
+          drawObjectsAndGrid(ctx);
+        };
+        // Si ya está cargada (caché del navegador), dibujarla de inmediato
+        if (img.complete) {
+           ctx.drawImage(img, 0, 0, width, height);
+           drawObjectsAndGrid(ctx);
+        }
+      } else {
+        drawObjectsAndGrid(ctx);
+      }
+    };
+
+    const drawObjectsAndGrid = (ctx: CanvasRenderingContext2D) => {
+
+      // Dibujar grid
+      if (snapToGrid) {
       ctx.strokeStyle = "#f0f0f0";
       ctx.lineWidth = 1;
       for (let x = 0; x < width; x += gridSize) {
@@ -277,8 +332,8 @@ export const LiveInteractionCanvas: React.FC<LiveInteractionCanvasProps> = ({
       }
     }
 
-    // Dibujar objetos
-    currentObjects.forEach((obj) => {
+      // Dibujar objetos
+      currentObjects.forEach((obj) => {
       const isSelected = state.selectedObjects.some((s) => s.id === obj.id);
 
       // Si tiene imagen, renderizar imagen
@@ -330,16 +385,19 @@ export const LiveInteractionCanvas: React.FC<LiveInteractionCanvasProps> = ({
         }
       }
 
-      // Dibujar etiqueta
-      ctx.fillStyle = "#000000";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.shadowColor = "rgba(255, 255, 255, 0.8)";
-      ctx.shadowBlur = 3;
-      ctx.fillText(obj.type.substring(0, 3).toUpperCase(), obj.x, obj.y);
-    });
-  }, [currentObjects, state.selectedObjects, width, height, gridSize, snapToGrid]);
+        // Dibujar etiqueta
+        ctx.fillStyle = "#000000";
+        ctx.font = "bold 12px Arial";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.shadowColor = "rgba(255, 255, 255, 0.8)";
+        ctx.shadowBlur = 3;
+        ctx.fillText(obj.type.substring(0, 3).toUpperCase(), obj.x, obj.y);
+      });
+    };
+
+    render();
+  }, [currentObjects, state.selectedObjects, width, height, gridSize, snapToGrid, backgroundImage]);
 
   return (
     <div className="relative">

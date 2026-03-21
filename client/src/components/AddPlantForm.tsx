@@ -9,6 +9,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { InventoryItem, PlantType, ClimateZone } from "@shared/inventory-types";
+import { useInventory } from "@/hooks/useInventory";
+import { trpc } from "@/lib/trpc";
 import { ImageUploader } from "./ImageUploader";
 
 interface AddPlantFormProps {
@@ -21,6 +23,8 @@ interface AddPlantFormProps {
  * Formulario para agregar o editar una planta
  */
 export function AddPlantForm({ initialData, onClose, onSave }: AddPlantFormProps) {
+  const { addPlant, updatePlant, uploadImage } = useInventory();
+  const uploadImageMutation = trpc.inventory.uploadImage.useMutation();
   const [formData, setFormData] = useState<Partial<InventoryItem>>(
     initialData || {
       name: "",
@@ -75,48 +79,41 @@ export function AddPlantForm({ initialData, onClose, onSave }: AddPlantFormProps
     return Object.keys(newErrors).length === 0;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
     if (!validateForm()) return;
 
-    const plant: InventoryItem = {
-      id: initialData?.id || `plant-${Date.now()}`,
+    const plantData = {
       name: formData.name!,
-      scientificName: formData.scientificName!,
+      scientificName: formData.scientificName || null,
       type: formData.type as PlantType,
-      description: formData.description || "",
-      imageUrl: formData.imageUrl || "https://via.placeholder.com/200?text=Plant",
+      description: formData.description || null,
+      imageUrl: formData.imageUrl || null,
       price: Number(formData.price) || 0,
       stock: Number(formData.stock) || 0,
       minStock: Number(formData.minStock) || 0,
-      climateZones: formData.climateZones || [ClimateZone.TEMPERATE],
-      matureHeight: Number(formData.matureHeight) || 0,
-      matureWidth: Number(formData.matureWidth) || 0,
-      minSpacing: Number(formData.minSpacing) || 0,
-      sunRequirement: (formData.sunRequirement as "full" | "partial" | "shade") || "full",
-      waterNeeds: (formData.waterNeeds as "low" | "medium" | "high") || "medium",
-      maintenanceLevel: (formData.maintenanceLevel as "low" | "medium" | "high") || "medium",
-      nativeRegion: formData.nativeRegion || "",
-      bloomSeason: formData.bloomSeason,
-      bloomColor: formData.bloomColor,
-      foliageColor: formData.foliageColor,
-      createdAt: initialData?.createdAt || Date.now(),
-      updatedAt: Date.now(),
-      isActive: formData.isActive !== false,
+      climate: formData.climateZones?.[0] || null, // Assuming single climate zone for now
+      matureHeight: Number(formData.matureHeight) || null,
+      matureWidth: Number(formData.matureWidth) || null,
+      minSpacing: Number(formData.minSpacing) || null,
+      lightRequirement: (formData.sunRequirement as "full" | "partial" | "shade") || null,
+      waterRequirement: (formData.waterNeeds as "low" | "medium" | "high") || null,
+      maintenanceLevel: (formData.maintenanceLevel as "low" | "medium" | "high") || null,
+      nativeRegion: formData.nativeRegion || null,
+      // bloomSeason: formData.bloomSeason || null,
+      // bloomColor: formData.bloomColor || null,
+      // foliageColor: formData.foliageColor || null,
+      // isActive: formData.isActive !== false,
     };
 
-    // Guardar en localStorage
-    const inventory = JSON.parse(localStorage.getItem("inventory") || "[]");
-    const index = inventory.findIndex((p: InventoryItem) => p.id === plant.id);
-    if (index >= 0) {
-      inventory[index] = plant;
+    let savedPlant: any;
+    if (initialData?.id) {
+      savedPlant = await updatePlant({ id: Number(initialData.id), ...(plantData as any) });
     } else {
-      inventory.push(plant);
+      savedPlant = await addPlant(plantData as any);
     }
-    localStorage.setItem("inventory", JSON.stringify(inventory));
-
-    onSave(plant);
+    onSave(savedPlant as InventoryItem);
   };
 
   return (
@@ -188,8 +185,20 @@ export function AddPlantForm({ initialData, onClose, onSave }: AddPlantFormProps
           Foto de la Planta
         </label>
         <ImageUploader
-          onImageUpload={(imageUrl) => handleChange("imageUrl", imageUrl)}
-          maxSizeMB={5}
+          onImageUpload={async (file) => {
+            if (file) {
+              const reader = new FileReader();
+              reader.readAsDataURL(file);
+              reader.onloadend = async () => {
+                const base64data = reader.result?.toString().split(",")[1];
+                if (base64data) {
+                  const result = await uploadImage({ fileData: base64data, mimeType: file.type });
+                  handleChange("imageUrl", result.imageUrl);
+                }
+              };
+            }
+          }}
+          maxSizeMB={20}
         />
         {formData.imageUrl && (
           <div className="mt-3 p-3 bg-blue-50 rounded-lg">

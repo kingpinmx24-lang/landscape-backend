@@ -7,7 +7,7 @@
 import { useCallback, useRef, useEffect, useState } from "react";
 
 interface DesignState {
-  objects: Array<{ id: string; x: number; y: number; type: string }>;
+  objects: Array<{ id: string; x: number; y: number; type: string; name?: string; cost?: number; radius?: number; rotation?: number; scale?: number; metadata?: Record<string, unknown> }>;
   materials: Record<string, string>;
   quotation: {
     totalCost: number;
@@ -92,56 +92,83 @@ export function useDesignSync(
   );
 
   /**
-   * Agregar objeto
+   * Agregar objeto (functional update to avoid stale closure)
    */
   const addObject = useCallback(
-    (object: { id: string; x: number; y: number; type: string }) => {
-      updateDesignState({
-        objects: [...designState.objects, object],
+    (object: { id: string; x: number; y: number; type: string; name?: string; cost?: number; radius?: number; rotation?: number; scale?: number; metadata?: Record<string, unknown> }) => {
+      setDesignState((prev) => {
+        // Avoid duplicates
+        if (prev.objects.some((o) => o.id === object.id)) return prev;
+        const newState = { ...prev, objects: [...prev.objects, object] };
+        newState.quotation = calculateQuotation(newState);
+        return newState;
       });
+      setIsDirty(true);
+      setSyncError(undefined);
     },
-    [designState.objects, updateDesignState]
+    [calculateQuotation]
   );
 
   /**
-   * Actualizar objeto
+   * Actualizar objeto (functional update to avoid stale closure)
    */
   const updateObject = useCallback(
-    (objectId: string, updates: Partial<{ x: number; y: number; type: string }>) => {
-      updateDesignState({
-        objects: designState.objects.map((obj) =>
-          obj.id === objectId ? { ...obj, ...updates } : obj
-        ),
+    (objectId: string, updates: Partial<{ x: number; y: number; type: string; name?: string; cost?: number; radius?: number; rotation?: number; scale?: number; metadata?: Record<string, unknown> }>) => {
+      setDesignState((prev) => {
+        const newState = {
+          ...prev,
+          objects: prev.objects.map((obj) =>
+            obj.id === objectId ? { ...obj, ...updates } : obj
+          ),
+        };
+        newState.quotation = calculateQuotation(newState);
+        return newState;
       });
+      setIsDirty(true);
+      setSyncError(undefined);
     },
-    [designState.objects, updateDesignState]
+    [calculateQuotation]
   );
 
   /**
-   * Eliminar objeto
+   * Eliminar objeto (functional update to avoid stale closure)
    */
   const deleteObject = useCallback(
     (objectId: string) => {
-      updateDesignState({
-        objects: designState.objects.filter((obj) => obj.id !== objectId),
+      setDesignState((prev) => {
+        const filtered = prev.objects.filter((obj) => obj.id !== objectId);
+        if (filtered.length === prev.objects.length) {
+          console.warn(`[useDesignSync] deleteObject: id "${objectId}" not found in ${prev.objects.length} objects`);
+          return prev; // Nothing changed
+        }
+        console.log(`[useDesignSync] deleteObject: removed "${objectId}", ${prev.objects.length} → ${filtered.length}`);
+        const newState = { ...prev, objects: filtered };
+        newState.quotation = calculateQuotation(newState);
+        return newState;
       });
+      setIsDirty(true);
+      setSyncError(undefined);
     },
-    [designState.objects, updateDesignState]
+    [calculateQuotation]
   );
 
   /**
-   * Aplicar material
+   * Aplicar material (functional update to avoid stale closure)
    */
   const applyMaterial = useCallback(
     (areaId: string, material: string) => {
-      updateDesignState({
-        materials: {
-          ...designState.materials,
-          [areaId]: material,
-        },
+      setDesignState((prev) => {
+        const newState = {
+          ...prev,
+          materials: { ...prev.materials, [areaId]: material },
+        };
+        newState.quotation = calculateQuotation(newState);
+        return newState;
       });
+      setIsDirty(true);
+      setSyncError(undefined);
     },
-    [designState.materials, updateDesignState]
+    [calculateQuotation]
   );
 
   /**

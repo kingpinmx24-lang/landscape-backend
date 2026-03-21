@@ -6,7 +6,7 @@
 
 export interface TerrainZone {
   id: string;
-  type: "soil" | "grass" | "stone" | "concrete";
+  type: "soil" | "grass" | "stone" | "concrete" | "sand";
   color: string;
   percentage: number;
   suggestedMaterials: string[];
@@ -20,7 +20,7 @@ export interface TerrainZone {
 
 export interface TerrainAnalysis {
   zones: TerrainZone[];
-  dominantType: "soil" | "grass" | "stone" | "concrete";
+  dominantType: "soil" | "grass" | "stone" | "concrete" | "sand";
   suggestions: {
     materials: string[];
     plants: string[];
@@ -68,11 +68,11 @@ export const analyzeTerrainImage = (
       // Solo incluir si es > 5%
       zones.push({
         id: `zone-${zoneId++}`,
-        type: type as "soil" | "grass" | "stone" | "concrete",
-        color: getColorForType(type as "soil" | "grass" | "stone" | "concrete"),
+        type: type as "soil" | "grass" | "stone" | "concrete" | "sand",
+        color: getColorForType(type as "soil" | "grass" | "stone" | "concrete" | "sand"),
         percentage,
         suggestedMaterials: getMaterialsForType(
-          type as "soil" | "grass" | "stone" | "concrete"
+          type as "soil" | "grass" | "stone" | "concrete" | "sand"
         ),
         bounds: {
           x: 0,
@@ -85,13 +85,13 @@ export const analyzeTerrainImage = (
   });
 
   // Determinar tipo dominante
-  let dominantType: "soil" | "grass" | "stone" | "concrete" = "soil";
+  let dominantType: "soil" | "grass" | "stone" | "concrete" | "sand" = "soil";
   let maxPercentage = 0;
 
   typePercentages.forEach((percentage, type) => {
     if (percentage > maxPercentage) {
       maxPercentage = percentage;
-      dominantType = type as "soil" | "grass" | "stone" | "concrete";
+      dominantType = type as "soil" | "grass" | "stone" | "concrete" | "sand";
     }
   });
 
@@ -115,18 +115,23 @@ const classifyPixel = (r: number, g: number, b: number): string => {
     return "grass";
   }
 
+  // Arena/Beige claro (Sand)
+  if (r > 180 && g > 160 && b > 120 && r > b && g > b && (r - g) < 40) {
+    return "sand";
+  }
+
   // Gris/Negro = Piedra/Concreto
-  if (Math.abs(r - g) < 20 && Math.abs(g - b) < 20 && r < 150) {
+  if (Math.abs(r - g) < 25 && Math.abs(g - b) < 25 && r < 160) {
     return "stone";
   }
 
   // Marrón/Rojo = Tierra
-  if (r > g && r > b && r - b > 30) {
+  if (r > g && r > b && r - b > 20) {
     return "soil";
   }
 
   // Gris claro = Concreto
-  if (r > 150 && Math.abs(r - g) < 20 && Math.abs(g - b) < 20) {
+  if (r > 160 && Math.abs(r - g) < 25 && Math.abs(g - b) < 25) {
     return "concrete";
   }
 
@@ -138,13 +143,14 @@ const classifyPixel = (r: number, g: number, b: number): string => {
  * Obtener color para tipo de terreno
  */
 const getColorForType = (
-  type: "soil" | "grass" | "stone" | "concrete"
+  type: "soil" | "grass" | "stone" | "concrete" | "sand"
 ): string => {
   const colors: Record<string, string> = {
     soil: "#8B7355",
     grass: "#7CB342",
     stone: "#757575",
     concrete: "#BDBDBD",
+    sand: "#E6D5A8",
   };
   return colors[type] || "#8B7355";
 };
@@ -153,13 +159,14 @@ const getColorForType = (
  * Obtener materiales sugeridos para tipo de terreno
  */
 const getMaterialsForType = (
-  type: "soil" | "grass" | "stone" | "concrete"
+  type: "soil" | "grass" | "stone" | "concrete" | "sand"
 ): string[] => {
   const materials: Record<string, string[]> = {
     soil: ["Pasto", "Mulch", "Grava", "Tierra Negra"],
     grass: ["Pasto Premium", "Semilla de Pasto", "Mantenimiento"],
     stone: ["Piedras de Río", "Grava Decorativa", "Adoquines"],
     concrete: ["Pintura", "Limpieza", "Remoción"],
+    sand: ["Estabilizador de arena", "Grava sobre arena", "Plantas de playa"],
   };
   return materials[type] || [];
 };
@@ -168,13 +175,14 @@ const getMaterialsForType = (
  * Obtener plantas sugeridas para tipo de terreno
  */
 const getPlantsForType = (
-  type: "soil" | "grass" | "stone" | "concrete"
+  type: "soil" | "grass" | "stone" | "concrete" | "sand"
 ): string[] => {
   const plants: Record<string, string[]> = {
     soil: ["Rosa", "Lavanda", "Arbusto Boxwood", "Árbol Oak"],
     grass: ["Pasto Perenne", "Trébol", "Hierba Ornamental"],
     stone: ["Suculentas", "Cactus", "Plantas Xerófitas"],
     concrete: ["Contenedores", "Plantas en Maceta", "Trepadoras"],
+    sand: ["Palmera", "Suculentas", "Cactus", "Pasto de playa"],
   };
   return plants[type] || [];
 };
@@ -183,13 +191,14 @@ const getPlantsForType = (
  * Obtener acciones sugeridas para tipo de terreno
  */
 const getActionsForType = (
-  type: "soil" | "grass" | "stone" | "concrete"
+  type: "soil" | "grass" | "stone" | "concrete" | "sand"
 ): string[] => {
   const actions: Record<string, string[]> = {
     soil: ["Preparar terreno", "Agregar fertilizante", "Nivelar"],
     grass: ["Riego regular", "Corte semanal", "Fertilización"],
     stone: ["Limpiar", "Reorganizar", "Agregar plantas"],
     concrete: ["Remover", "Reparar", "Pintar o sellar"],
+    sand: ["Nivelar", "Compactar", "Añadir capa de tierra vegetal"],
   };
   return actions[type] || [];
 };

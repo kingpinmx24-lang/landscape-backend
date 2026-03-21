@@ -25,7 +25,12 @@ export function useInventory() {
   const [filters, setFilters] = useState<InventoryFilters>({});
   
   // Usar tRPC para obtener el inventario real
-  const inventoryQuery = trpc.inventory.getAll.useQuery();
+  const inventoryQuery = trpc.inventory.list.useQuery();
+  const addPlantMutation = trpc.inventory.add.useMutation();
+  const updatePlantMutation = trpc.inventory.update.useMutation();
+  const deletePlantMutation = trpc.inventory.delete.useMutation();
+  const updateStockMutation = trpc.inventory.updateStock.useMutation();
+  const uploadImageMutation = trpc.inventory.uploadImage.useMutation();
 
   // Actualizar el estado local cuando cambian los datos de tRPC
   useEffect(() => {
@@ -61,7 +66,7 @@ export function useInventory() {
    * Cargar inventario (ahora manejado por tRPC)
    */
   const loadInventory = useCallback(async () => {
-    inventoryQuery.refetch();
+    await inventoryQuery.refetch();
   }, [inventoryQuery]);
 
   /**
@@ -279,16 +284,17 @@ export function useInventory() {
    * Actualizar stock (después de usar en diseño)
    */
   const updateStock = useCallback(
-    (inventoryItemId: string, change: number) => {
-      setInventory((prev) =>
-        prev.map((item) =>
-          item.id === inventoryItemId
-            ? { ...item, stock: Math.max(0, item.stock + change) }
-            : item
-        )
-      );
+    async (inventoryItemId: string | number, change: number) => {
+      const numericId = typeof inventoryItemId === 'string' ? parseInt(inventoryItemId, 10) : inventoryItemId;
+      if (isNaN(numericId)) return;
+      try {
+        await updateStockMutation.mutateAsync({ id: numericId, quantity: change });
+        await inventoryQuery.refetch();
+      } catch (err) {
+        console.warn('[useInventory] updateStock failed:', err);
+      }
     },
-    []
+    [updateStockMutation, inventoryQuery]
   );
 
   return {
@@ -314,5 +320,11 @@ export function useInventory() {
     // Utilidades
     getInventoryItem,
     updateStock,
+
+    // Mutaciones
+    addPlant: addPlantMutation.mutateAsync,
+    updatePlant: updatePlantMutation.mutateAsync,
+    deletePlant: deletePlantMutation.mutateAsync,
+    uploadImage: uploadImageMutation.mutateAsync,
   };
 }

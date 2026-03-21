@@ -112,6 +112,7 @@ export interface DesignData {
     finalPrice: number;
   };
   timestamp: number;
+  captureImage?: string;
 }
 
 /**

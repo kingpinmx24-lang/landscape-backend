@@ -1,9 +1,29 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { useRoute, useLocation } from "wouter";
 import { Button } from "../components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { ArrowLeft, Loader2 } from "lucide-react";
+
+/**
+ * Resolve the capture image from all possible storage locations.
+ */
+function resolveCaptureImage(projectId: string, project: any): string | undefined {
+  // 1. Separate key (primary)
+  const separate = localStorage.getItem(`captureImage_${projectId}`);
+  if (separate && separate.startsWith("data:")) return separate;
+
+  // 2. Inline in project (if it's a real data URL)
+  if (project.captureImage && typeof project.captureImage === "string" && project.captureImage.startsWith("data:")) {
+    return project.captureImage;
+  }
+
+  // 3. Legacy capture object
+  if (project.capture?.imageUrl?.startsWith("data:")) return project.capture.imageUrl;
+  if (project.capture?.imageBase64?.startsWith("data:")) return project.capture.imageBase64;
+
+  return undefined;
+}
 
 export default function Design() {
   const [, params] = useRoute("/projects/:id/design");
@@ -16,6 +36,11 @@ export default function Design() {
   const project = projectId
     ? JSON.parse(localStorage.getItem(`project_${projectId}`) || "{}")
     : null;
+
+  const captureImage = useMemo(
+    () => (projectId && project?.id ? resolveCaptureImage(projectId, project) : undefined),
+    [projectId, project?.id]
+  );
 
   if (!project || !project.id) {
     return (
@@ -35,7 +60,7 @@ export default function Design() {
     );
   }
 
-  if (!project.captureImage) {
+  if (!captureImage) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
         <Card className="max-w-md">
@@ -64,6 +89,10 @@ export default function Design() {
         updatedAt: new Date().toISOString(),
       };
 
+      // Don't include captureImage in project metadata to keep it small
+      delete updatedProject.captureImage;
+      updatedProject.captureImage = "__stored_separately__";
+
       try {
         localStorage.setItem(`project_${projectId}`, JSON.stringify(updatedProject));
       } catch (storageErr) {
@@ -84,17 +113,18 @@ export default function Design() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       <header className="bg-white border-b border-gray-200">
-        <div className="max-w-6xl mx-auto px-4 py-6 flex items-center gap-4">
+        <div className="max-w-6xl mx-auto px-4 py-4 md:py-6 flex items-center gap-2 md:gap-4">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => window.history.back()}
+            className="shrink-0"
           >
             <ArrowLeft className="w-4 h-4" />
           </Button>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">Paso 3: Diseño</h1>
-            <p className="text-sm text-gray-600">
+            <h1 className="text-xl md:text-2xl font-bold text-gray-900">Paso 3: Diseño</h1>
+            <p className="text-xs md:text-sm text-gray-600">
               Proyecto: {project.name}
             </p>
           </div>
@@ -113,7 +143,7 @@ export default function Design() {
             </CardHeader>
             <CardContent>
               <img
-                src={project.captureImage}
+                src={captureImage}
                 alt="Terreno capturado"
                 className="w-full h-96 object-cover rounded-lg border border-gray-200"
               />
@@ -153,7 +183,7 @@ export default function Design() {
 
                 <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                   <p className="text-sm text-blue-900">
-                    ℹ️ El análisis automático de zonas se ejecutará en el siguiente paso.
+                    El análisis automático de zonas se ejecutará en el siguiente paso.
                   </p>
                 </div>
 

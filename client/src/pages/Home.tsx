@@ -32,8 +32,8 @@ export default function Home() {
               </div>
               <h1 className="text-2xl font-bold text-gray-900">LandscapeApp</h1>
             </div>
-            <Button onClick={() => window.location.href = getLoginUrl()}>
-              Iniciar Sesión
+            <Button onClick={() => window.location.href = "/projects/new"}>
+              Comenzar Ahora
             </Button>
           </div>
         </header>
@@ -49,7 +49,7 @@ export default function Home() {
             </p>
             <Button
               size="lg"
-              onClick={() => window.location.href = getLoginUrl()}
+              onClick={() => window.location.href = "/projects/new"}
               className="bg-gradient-to-r from-green-500 to-blue-600 text-white px-8 py-6 text-lg"
             >
               Comenzar Ahora
@@ -189,7 +189,7 @@ export default function Home() {
             </p>
             <Button
               size="lg"
-              onClick={() => window.location.href = getLoginUrl()}
+              onClick={() => window.location.href = "/projects/new"}
               className="bg-white text-blue-600 hover:bg-gray-100"
             >
               Iniciar Sesión

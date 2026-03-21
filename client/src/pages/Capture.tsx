@@ -40,39 +40,48 @@ export default function Capture() {
     );
   }
 
-  const compressImage = async (base64: string): Promise<string> => {
-    return new Promise((resolve) => {
+  /**
+   * Compress image to a reasonable size for localStorage.
+   * Target: ~100-200KB base64 string.
+   */
+  const compressImage = async (base64: string, maxW = 800, maxH = 600, quality = 0.6): Promise<string> => {
+    return new Promise((resolve, reject) => {
       const img = new Image();
-      img.src = base64;
       img.onload = () => {
-        const canvas = document.createElement("canvas");
-        const maxWidth = 800;
-        const maxHeight = 600;
-        let width = img.width;
-        let height = img.height;
+        try {
+          const canvas = document.createElement("canvas");
+          let width = img.width;
+          let height = img.height;
 
-        if (width > height) {
-          if (width > maxWidth) {
-            height = Math.round((height * maxWidth) / width);
-            width = maxWidth;
+          // Scale down proportionally
+          if (width > height) {
+            if (width > maxW) {
+              height = Math.round((height * maxW) / width);
+              width = maxW;
+            }
+          } else {
+            if (height > maxH) {
+              width = Math.round((width * maxH) / height);
+              height = maxH;
+            }
           }
-        } else {
-          if (height > maxHeight) {
-            width = Math.round((width * maxHeight) / height);
-            height = maxHeight;
-          }
-        }
 
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext("2d");
-        if (ctx) {
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) {
+            resolve(base64);
+            return;
+          }
           ctx.drawImage(img, 0, 0, width, height);
-          resolve(canvas.toDataURL("image/jpeg", 0.7));
-        } else {
-          resolve(base64);
+          const compressed = canvas.toDataURL("image/jpeg", quality);
+          resolve(compressed);
+        } catch (err) {
+          reject(err);
         }
       };
+      img.onerror = () => reject(new Error("Failed to load image for compression"));
+      img.src = base64;
     });
   };
 
@@ -112,17 +121,21 @@ export default function Capture() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.size > 5 * 1024 * 1024) {
-      setError("La imagen es muy grande (máximo 5MB)");
+    if (file.size > 20 * 1024 * 1024) {
+      setError("La imagen es muy grande (máximo 20MB)");
       return;
     }
 
     const reader = new FileReader();
     reader.onload = async (event) => {
-      const base64 = event.target?.result as string;
-      const compressed = await compressImage(base64);
-      setPhoto(compressed);
-      setError(null);
+      try {
+        const base64 = event.target?.result as string;
+        const compressed = await compressImage(base64);
+        setPhoto(compressed);
+        setError(null);
+      } catch (err) {
+        setError("Error al procesar la imagen");
+      }
     };
     reader.readAsDataURL(file);
   };
@@ -137,38 +150,63 @@ export default function Capture() {
       setIsLoading(true);
       setError(null);
 
-      const compressed = await compressImage(photo);
-      console.log("Foto comprimida, tamaño:", compressed.length);
+      // Compress aggressively to fit in localStorage
+      const compressed = await compressImage(photo, 800, 600, 0.5);
+      console.log("[Capture] Compressed image size:", compressed.length, "chars");
 
+      // Strategy: save image in a SEPARATE localStorage key to avoid quota issues
+      // Also save in the project object as a fallback
+      let imageSaved = false;
+
+      // First: try saving image separately
+      try {
+        localStorage.setItem(`captureImage_${projectId}`, compressed);
+        console.log("[Capture] Image saved to captureImage_" + projectId);
+        imageSaved = true;
+      } catch (e1) {
+        console.warn("[Capture] Failed to save image separately, trying smaller compression");
+        // Try even more aggressive compression
+        try {
+          const smaller = await compressImage(photo, 600, 450, 0.3);
+          localStorage.setItem(`captureImage_${projectId}`, smaller);
+          console.log("[Capture] Smaller image saved to captureImage_" + projectId);
+          imageSaved = true;
+        } catch (e2) {
+          console.error("[Capture] Cannot save image to localStorage at all");
+        }
+      }
+
+      // Second: update project metadata (without the image to keep it small)
       const updatedProject = {
         ...project,
-        captureImage: compressed,
+        captureImage: imageSaved ? "__stored_separately__" : compressed,
         status: "captured",
         updatedAt: new Date().toISOString(),
       };
 
-      console.log("Guardando proyecto:", projectId, updatedProject);
-
-      let saved = false;
       try {
         localStorage.setItem(`project_${projectId}`, JSON.stringify(updatedProject));
-        console.log("Proyecto guardado en localStorage");
-        saved = true;
-      } catch (storageErr) {
-        console.warn("localStorage lleno, usando sessionStorage como fallback");
+        console.log("[Capture] Project metadata saved");
+      } catch (e3) {
+        // If even metadata fails, try sessionStorage
         sessionStorage.setItem(`project_${projectId}`, JSON.stringify(updatedProject));
-        console.log("Proyecto guardado en sessionStorage");
-        saved = true;
+        console.warn("[Capture] Used sessionStorage for project metadata");
       }
 
-      if (saved) {
-        console.log("Redirigiendo a /projects/" + projectId + "/design");
+      // Verify the save worked
+      const verifyImage = localStorage.getItem(`captureImage_${projectId}`);
+      const verifyProject = localStorage.getItem(`project_${projectId}`);
+      console.log("[Capture] Verification - image key exists:", !!verifyImage, "project exists:", !!verifyProject);
+
+      if (verifyImage || verifyProject) {
         setLocation(`/projects/${projectId}/design`);
+      } else {
+        setError("Error al guardar la foto. Intenta de nuevo.");
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Error al guardar la foto";
       setError(message);
-      console.error("Error:", err);
+      console.error("[Capture] Error:", err);
     } finally {
       setIsLoading(false);
     }
@@ -177,17 +215,18 @@ export default function Capture() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       <header className="bg-white border-b border-gray-200">
-        <div className="max-w-4xl mx-auto px-4 py-6 flex items-center gap-4">
+        <div className="max-w-4xl mx-auto px-4 py-4 md:py-6 flex items-center gap-2 md:gap-4">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => window.history.back()}
+            className="shrink-0"
           >
             <ArrowLeft className="w-4 h-4" />
           </Button>
           <div>
-            <h1 className="text-2xl font-bold text-gray-900">Paso 1: Captura</h1>
-            <p className="text-sm text-gray-600">
+            <h1 className="text-xl md:text-2xl font-bold text-gray-900">Paso 1: Captura</h1>
+            <p className="text-xs md:text-sm text-gray-600">
               Proyecto: {project.name}
             </p>
           </div>
@@ -305,7 +344,7 @@ export default function Capture() {
 
             <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
               <p className="text-sm text-blue-900">
-                💡 <strong>Consejo:</strong> Toma la foto desde un ángulo elevado para
+                <strong>Consejo:</strong> Toma la foto desde un ángulo elevado para
                 capturar toda el área. Asegúrate de que haya buena iluminación.
               </p>
             </div>

@@ -1,22 +1,50 @@
 /**
  * Component: AdjustLiveStep
  * ============================================================================
- * Paso 4 del flujo: Ajuste en vivo con interacción completa e inventario real
+ * PRODUCTION VERSION
+ *
+ * Features:
+ * 1. AI Inpainting — click "Borrar con AI" on an obstacle → backend erases it
+ *    from the actual photo using DALL-E 2 and returns the cleaned image.
+ * 2. Drag & Drop from Inventory — drag a plant from the inventory panel and
+ *    drop it anywhere on the canvas. It appears at the exact drop position.
+ * 3. Click to add from inventory — click "Usar" on any plant to add it.
+ * 4. AI Assistant — natural language: "limpia el terreno", "pon una palmera",
+ *    "cuánto cuesta", "quita la caseta".
+ * 5. Responsive — mobile / tablet / desktop layouts.
  */
 
-import React, { useCallback, useState, useEffect, useMemo } from "react";
-import { LiveInteractionCanvas } from "./LiveInteractionCanvas";
-import { FloatingControls } from "./FloatingControls";
+import React, {
+  useCallback,
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+} from "react";
+import { ImprovedLiveCanvas } from "./ImprovedLiveCanvas";
 import { MaterialEditor } from "./MaterialEditor";
 import { InventoryPanel } from "./InventoryPanel";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Save, Undo2, Redo2, ShoppingBag } from "lucide-react";
+import {
+  Save,
+  Undo2,
+  Redo2,
+  ShoppingBag,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  Wand2,
+} from "lucide-react";
 import { useLiveInteraction } from "@/hooks/useLiveInteraction";
 import { useDesignSync } from "@/hooks/useDesignSync";
 import { useInventory } from "@/hooks/useInventory";
 import { DesignData, AdjustLiveData } from "@shared/workflow-persistence-types";
+import { AIDesignAssistant } from "./AIDesignAssistant";
+import { ObstacleDetector, Obstacle, runObstacleDetection } from "./ObstacleDetector";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 interface AdjustLiveStepProps {
   projectId: string;
@@ -25,33 +53,144 @@ interface AdjustLiveStepProps {
   onCancel?: () => void;
 }
 
-/**
- * Componente AdjustLiveStep
- */
+// ─── Device detection ────────────────────────────────────────────────────────
+
+function useDeviceType(): "mobile" | "tablet" | "desktop" {
+  const [device, setDevice] = useState<"mobile" | "tablet" | "desktop">(() => {
+    const w = typeof window !== "undefined" ? window.innerWidth : 1200;
+    if (w < 640) return "mobile";
+    if (w < 1024) return "tablet";
+    return "desktop";
+  });
+
+  useEffect(() => {
+    const check = () => {
+      const w = window.innerWidth;
+      if (w < 640) setDevice("mobile");
+      else if (w < 1024) setDevice("tablet");
+      else setDevice("desktop");
+    };
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
+
+  return device;
+}
+
+// ─── Resolve capture image ───────────────────────────────────────────────────
+
+function resolveCaptureImage(
+  projectId: string,
+  initialDesign: DesignData
+): string {
+  if (initialDesign?.captureImage) return initialDesign.captureImage;
+  try {
+    const stored = localStorage.getItem(`captureImage_${projectId}`);
+    if (stored) return stored;
+  } catch {}
+  try {
+    const designKey = Object.keys(localStorage).find(
+      (k) => k.startsWith("design_") && k.includes(projectId)
+    );
+    if (designKey) {
+      const data = JSON.parse(localStorage.getItem(designKey) || "{}");
+      if (data.captureImage) return data.captureImage;
+    }
+  } catch {}
+  try {
+    const projData = JSON.parse(
+      localStorage.getItem(`project_${projectId}`) || "{}"
+    );
+    if (projData.captureImage) return projData.captureImage;
+  } catch {}
+  return "";
+}
+
+// ─── Inpainting API call ─────────────────────────────────────────────────────
+
+async function callInpaintAPI(
+  imageBase64: string,
+  obstacles: Obstacle[]
+): Promise<string> {
+  const payload = {
+    imageBase64,
+    obstacles: obstacles.map((o) => ({
+      x: o.x,
+      y: o.y,
+      width: o.width,
+      height: o.height,
+      label: o.label,
+    })),
+  };
+
+  const backendUrl =
+    (import.meta as any).env?.VITE_BACKEND_URL ||
+    "https://landscape-backend.onrender.com";
+
+  const response = await fetch(`${backendUrl}/api/inpaint`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({ error: "Unknown error" }));
+    throw new Error(err.error || `HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.imageBase64 as string;
+}
+
+// ─── Main Component ──────────────────────────────────────────────────────────
+
 export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
   projectId,
   initialDesign,
   onComplete,
   onCancel,
 }) => {
-  const [activeTab, setActiveTab] = useState<"canvas" | "materials" | "inventory">("canvas");
+  const device = useDeviceType();
+  const [activeTab, setActiveTab] = useState<
+    "canvas" | "materials" | "inventory"
+  >("canvas");
   const [userNotes, setUserNotes] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [showQuotation, setShowQuotation] = useState(true);
 
-  // Hooks de interacción y sincronización
+  // ─── Background image (can be updated by inpainting) ───
+  const originalCaptureImage = useMemo(
+    () => resolveCaptureImage(projectId, initialDesign),
+    [projectId, initialDesign]
+  );
+  const [backgroundImage, setBackgroundImage] = useState(originalCaptureImage);
+
+  // ─── Obstacle state ───
+  const [detectedObstacles, setDetectedObstacles] = useState<Obstacle[]>([]);
+  const [isDetecting, setIsDetecting] = useState(false);
+  const [showObstacles, setShowObstacles] = useState(true);
+  const [detectionError, setDetectionError] = useState<string | null>(null);
+
+  // ─── Inpainting state ───
+  const [inpaintingObstacleId, setInpaintingObstacleId] = useState<
+    string | null
+  >(null);
+  const [inpaintError, setInpaintError] = useState<string | null>(null);
+
+  // ─── Canvas drop zone ref ───
+  const canvasContainerRef = useRef<HTMLDivElement>(null);
+
   const liveInteraction = useLiveInteraction();
   const designSync = useDesignSync(projectId, {
     autoSaveInterval: 2000,
     debounceDelay: 500,
     enableOfflineMode: true,
   });
-
-  // Hook de inventario
   const { getInventoryItem } = useInventory();
 
-  // Inicializar con diseño inicial
+  // ─── Load initial design ───
   useEffect(() => {
-    if (initialDesign && initialDesign.plants) {
+    if (initialDesign?.plants) {
       designSync.updateDesignState({
         objects: initialDesign.plants.map((p) => ({
           id: p.id,
@@ -71,28 +210,27 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
     }
   }, [initialDesign]);
 
-  /**
-   * Calcular cotización en tiempo real basada en los objetos actuales
-   */
+  // ─── Quotation ───
   const currentQuotation = useMemo(() => {
-    const plantsCost = designSync.designState.objects.reduce((sum, obj) => {
-      // Intentar obtener el precio del inventario si existe el ID en metadata
+    const objs = designSync.designState.objects.filter(
+      (o) => o.type !== "obstacle"
+    );
+    const plantsCost = objs.reduce((sum, obj) => {
       const inventoryId = obj.metadata?.inventoryId as string;
       if (inventoryId) {
         const item = getInventoryItem(inventoryId);
         return sum + (item?.price || 0);
       }
-      // Fallback al costo guardado en el objeto
       return sum + (obj.cost || 0);
     }, 0);
-
-    const materialsCost = Object.keys(designSync.designState.materials).length * 50; // Costo fijo por área de material
-    const laborCost = (designSync.designState.objects.length * 10) + (Object.keys(designSync.designState.materials).length * 20);
-    const subtotal = plantsCost + materialsCost + laborCost;
+    const materialsCost =
+      Object.keys(designSync.designState.materials).length * 50;
+    const laborCost =
+      objs.length * 10 +
+      Object.keys(designSync.designState.materials).length * 20;
+    const totalCost = plantsCost + materialsCost + laborCost;
     const margin = 0.3;
-    const totalCost = subtotal;
     const finalPrice = totalCost * (1 + margin);
-
     return {
       plantsCost,
       materialsCost,
@@ -101,114 +239,203 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
       margin,
       finalPrice,
     };
-  }, [designSync.designState.objects, designSync.designState.materials, getInventoryItem]);
+  }, [
+    designSync.designState.objects,
+    designSync.designState.materials,
+    getInventoryItem,
+  ]);
 
-  /**
-   * Manejar selección de objeto
-   */
-  const handleSelectObject = useCallback(
-    (object: any) => {
-      liveInteraction.selectObject(object);
+  // ─── Detect obstacles ───
+  const handleDetect = useCallback(async () => {
+    if (!backgroundImage) {
+      setDetectionError("No se encontró la imagen del terreno.");
+      return;
+    }
+    setIsDetecting(true);
+    setDetectionError(null);
+    try {
+      const result = await runObstacleDetection(backgroundImage, 800, 600);
+      setDetectedObstacles(result);
+      setShowObstacles(true);
+    } catch (err: any) {
+      setDetectionError(err.message || "Error al detectar obstáculos");
+    } finally {
+      setIsDetecting(false);
+    }
+  }, [backgroundImage]);
+
+  // ─── Remove obstacle (marker only) ───
+  const handleObstacleRemove = useCallback((obstacleId: string) => {
+    setDetectedObstacles((prev) => prev.filter((o) => o.id !== obstacleId));
+  }, []);
+
+  // ─── Clear all obstacles ───
+  const handleClearAllObstacles = useCallback(() => {
+    setDetectedObstacles([]);
+  }, []);
+
+  // ─── Toggle visibility ───
+  const handleToggleVisibility = useCallback(() => {
+    setShowObstacles((prev) => !prev);
+  }, []);
+
+  // ─── AI Inpainting: erase obstacle from the actual photo ───
+  const handleInpaintObstacle = useCallback(
+    async (obstacleId: string) => {
+      const obstacle = detectedObstacles.find((o) => o.id === obstacleId);
+      if (!obstacle || !backgroundImage) return;
+
+      setInpaintingObstacleId(obstacleId);
+      setInpaintError(null);
+
+      try {
+        const cleanedImage = await callInpaintAPI(backgroundImage, [obstacle]);
+        // Update the background image with the cleaned version
+        setBackgroundImage(cleanedImage);
+        // Save to localStorage so it persists
+        try {
+          localStorage.setItem(`captureImage_${projectId}`, cleanedImage);
+        } catch {}
+        // Remove the obstacle marker
+        setDetectedObstacles((prev) => prev.filter((o) => o.id !== obstacleId));
+      } catch (err: any) {
+        setInpaintError(
+          err.message || "Error al borrar el objeto de la foto"
+        );
+      } finally {
+        setInpaintingObstacleId(null);
+      }
     },
-    [liveInteraction]
+    [detectedObstacles, backgroundImage, projectId]
   );
 
-  /**
-   * Manejar movimiento de objeto
-   */
-  const handleMoveObject = useCallback(
-    (moveData: any) => {
-      liveInteraction.moveObject(moveData);
-      designSync.updateObject(moveData.objectId, {
-        x: moveData.newX,
-        y: moveData.newY,
+  // ─── AI Inpainting: erase ALL obstacles from the photo ───
+  const handleInpaintAll = useCallback(async () => {
+    if (detectedObstacles.length === 0 || !backgroundImage) return;
+
+    setInpaintingObstacleId("all");
+    setInpaintError(null);
+
+    try {
+      const cleanedImage = await callInpaintAPI(
+        backgroundImage,
+        detectedObstacles
+      );
+      setBackgroundImage(cleanedImage);
+      try {
+        localStorage.setItem(`captureImage_${projectId}`, cleanedImage);
+      } catch {}
+      setDetectedObstacles([]);
+    } catch (err: any) {
+      setInpaintError(err.message || "Error al limpiar el terreno");
+    } finally {
+      setInpaintingObstacleId(null);
+    }
+  }, [detectedObstacles, backgroundImage, projectId]);
+
+  // ─── Add plant from inventory (click) ───
+  const handleSelectPlantFromInventory = useCallback(
+    (inventoryItemId: string) => {
+      const item = getInventoryItem(inventoryItemId);
+      if (!item) return;
+      const newPlant = {
+        id: `plant-${Date.now()}`,
+        type: item.type,
+        x: 150 + Math.random() * 200,
+        y: 150 + Math.random() * 200,
+        radius: 25,
+        name: item.name,
+        cost: item.price,
+        metadata: {
+          inventoryId: item.id,
+          scientificName: item.scientificName,
+          imageUrl: item.imageUrl,
+          name: item.name,
+        },
+      };
+      designSync.addObject(newPlant);
+      setActiveTab("canvas");
+    },
+    [getInventoryItem, designSync]
+  );
+
+  // ─── Drop plant from inventory onto canvas ───
+  const handleCanvasDrop = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      const data = e.dataTransfer.getData("application/json");
+      if (!data) return;
+
+      let plantData: {
+        type: string;
+        id: string | number;
+        name: string;
+        imageUrl?: string;
+        price?: number;
+      };
+      try {
+        plantData = JSON.parse(data);
+      } catch {
+        return;
+      }
+
+      if (plantData.type !== "plant") return;
+
+      // Calculate drop position relative to canvas (0-800 x 0-600 internal)
+      const container = canvasContainerRef.current;
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const relX = e.clientX - rect.left;
+      const relY = e.clientY - rect.top;
+      const scaleX = 800 / rect.width;
+      const scaleY = 600 / rect.height;
+      const canvasX = relX * scaleX;
+      const canvasY = relY * scaleY;
+
+      const item = getInventoryItem(String(plantData.id));
+      const newPlant = {
+        id: `plant-${Date.now()}`,
+        type: item?.type || "tree",
+        x: canvasX,
+        y: canvasY,
+        radius: 25,
+        name: plantData.name,
+        cost: plantData.price || item?.price || 0,
+        metadata: {
+          inventoryId: String(plantData.id),
+          imageUrl: plantData.imageUrl || item?.imageUrl,
+          name: plantData.name,
+        },
+      };
+      designSync.addObject(newPlant);
+      setActiveTab("canvas");
+    },
+    [getInventoryItem, designSync]
+  );
+
+  // ─── Canvas objects change ───
+  const handleObjectsChange = useCallback(
+    (objs: any[]) => {
+      const plantObjs = objs.filter((o) => o.type !== "obstacle");
+      designSync.updateDesignState({
+        objects: plantObjs.map((obj) => ({
+          id: obj.id,
+          type: obj.type,
+          x: obj.x,
+          y: obj.y,
+          name: (obj.metadata?.name as string) || obj.type,
+          cost: (obj.metadata?.price as number) || 0,
+          metadata: obj.metadata,
+        })),
       });
     },
-    [liveInteraction, designSync]
-  );
-
-  /**
-   * Manejar eliminación de objeto
-   */
-  const handleDeleteObject = useCallback(
-    (deleteData: any) => {
-      const objectId = typeof deleteData === 'string' ? deleteData : deleteData.id;
-      liveInteraction.deleteObject({ id: objectId } as any);
-      designSync.deleteObject(objectId);
-    },
-    [liveInteraction, designSync]
-  );
-
-  /**
-   * Manejar duplicación de objeto
-   */
-  const handleDuplicateObject = useCallback(
-    (object: any) => {
-      const newObject = {
-        ...object,
-        id: `${object.id}-${Date.now()}`,
-        x: object.x + 50,
-        y: object.y + 50,
-      };
-      designSync.addObject(newObject);
-    },
     [designSync]
   );
 
-  /**
-   * Manejar cambio de tipo de objeto
-   */
-  const handleChangeObjectType = useCallback(
-    (objectId: string, newType: string) => {
-      designSync.updateObject(objectId, { type: newType });
-    },
-    [designSync]
-  );
-
-  /**
-   * Manejar aplicación de material
-   */
-  const handleApplyMaterial = useCallback(
-    (material: string, area: Array<{ x: number; y: number }>) => {
-      const areaId = `area-${Date.now()}`;
-      designSync.applyMaterial(areaId, material);
-    },
-    [designSync]
-  );
-
-  /**
-   * Manejar selección de planta desde el inventario
-   */
-  const handleSelectPlantFromInventory = useCallback((inventoryItemId: string) => {
-    const item = getInventoryItem(inventoryItemId);
-    if (!item) return;
-
-    const newPlant = {
-      id: `plant-${Date.now()}`,
-      type: item.type,
-      x: 100 + Math.random() * 200,
-      y: 100 + Math.random() * 200,
-      radius: 20,
-      name: item.name,
-      cost: item.price,
-      metadata: {
-        inventoryId: item.id,
-        scientificName: item.scientificName,
-        imageUrl: item.imageUrl,
-      },
-    };
-
-    designSync.addObject(newPlant);
-    setActiveTab("canvas"); // Volver al canvas para ver la planta agregada
-  }, [getInventoryItem, designSync]);
-
-  /**
-   * Manejar completar ajuste
-   */
+  // ─── Complete ───
   const handleComplete = useCallback(async () => {
     try {
       setIsSubmitting(true);
-
       const adjustmentData: AdjustLiveData = {
         changes: liveInteraction.state.history.map((action, index) => ({
           id: `change-${index}`,
@@ -221,218 +448,546 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
         })),
         finalDesign: {
           ...initialDesign,
-          plants: designSync.designState.objects.map((obj) => ({
-            id: obj.id,
-            type: obj.type,
-            x: obj.x,
-            y: obj.y,
-            radius: 20,
-            name: obj.name || obj.type,
-            cost: obj.cost || 0,
-            metadata: obj.metadata,
-          })),
-          materials: Object.entries(designSync.designState.materials).map(([id, type]) => ({
-            id,
-            type: type as any,
-            polygon: [], // En una implementación real, guardaríamos el polígono
-            area: 1,
-            cost: 50,
-          })),
+          captureImage: backgroundImage,
+          plants: designSync.designState.objects
+            .filter((o) => o.type !== "obstacle")
+            .map((obj) => ({
+              id: obj.id,
+              type: obj.type,
+              x: obj.x,
+              y: obj.y,
+              radius: 20,
+              name: obj.name || obj.type,
+              cost: obj.cost || 0,
+              metadata: obj.metadata,
+            })),
+          materials: Object.entries(designSync.designState.materials).map(
+            ([id, type]) => ({
+              id,
+              type: type as any,
+              polygon: [],
+              area: 1,
+              cost: 50,
+            })
+          ),
           quotation: currentQuotation,
           timestamp: Date.now(),
         },
         userNotes,
         timestamp: Date.now(),
       };
-
-      // Guardar cambios
       await designSync.manualSync();
-
       onComplete?.(adjustmentData);
     } catch (error) {
       console.error("Error al completar ajuste:", error);
     } finally {
       setIsSubmitting(false);
     }
-  }, [liveInteraction, designSync, initialDesign, userNotes, onComplete, currentQuotation]);
+  }, [
+    liveInteraction,
+    designSync,
+    initialDesign,
+    userNotes,
+    onComplete,
+    currentQuotation,
+    backgroundImage,
+  ]);
 
+  // ─── Derived state ───
+  const visibleObstacles = showObstacles ? detectedObstacles : [];
+  const plantObjects = useMemo(
+    () =>
+      designSync.designState.objects
+        .filter((obj) => obj.type !== "obstacle")
+        .map((obj) => ({ ...obj, radius: 25 })),
+    [designSync.designState.objects]
+  );
+  const plantCount = designSync.designState.objects.filter(
+    (o) => o.type !== "obstacle"
+  ).length;
+  const isInpainting = inpaintingObstacleId !== null;
+
+  // ─── Obstacle Panel ───────────────────────────────────────────────────────
+  const obstaclePanelJSX = (
+    <div className="space-y-2">
+      <h3 className="font-semibold text-xs sm:text-sm text-gray-700">
+        Detección de Terreno
+      </h3>
+
+      {/* Detect button */}
+      <Button
+        onClick={handleDetect}
+        disabled={isDetecting || isInpainting}
+        size="sm"
+        className="w-full bg-orange-500 hover:bg-orange-600 text-white text-xs h-8"
+      >
+        {isDetecting ? (
+          <>
+            <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+            Detectando...
+          </>
+        ) : (
+          "🔍 Detectar Obstáculos"
+        )}
+      </Button>
+
+      {detectionError && (
+        <p className="text-xs text-red-500">{detectionError}</p>
+      )}
+
+      {inpaintError && (
+        <p className="text-xs text-red-500">{inpaintError}</p>
+      )}
+
+      {/* Obstacle list */}
+      {detectedObstacles.length > 0 && (
+        <div className="space-y-1">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] text-gray-500">
+              {detectedObstacles.length} obstáculo
+              {detectedObstacles.length !== 1 ? "s" : ""}
+            </span>
+            <div className="flex gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleToggleVisibility}
+                className="h-6 px-2 text-[10px]"
+              >
+                {showObstacles ? "Ocultar" : "Mostrar"}
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={handleClearAllObstacles}
+                className="h-6 px-2 text-[10px]"
+              >
+                Quitar todos
+              </Button>
+            </div>
+          </div>
+
+          {/* Clean with AI button */}
+          <Button
+            onClick={handleInpaintAll}
+            disabled={isInpainting}
+            size="sm"
+            className="w-full bg-purple-600 hover:bg-purple-700 text-white text-xs h-8"
+          >
+            {isInpainting && inpaintingObstacleId === "all" ? (
+              <>
+                <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                Limpiando terreno...
+              </>
+            ) : (
+              <>
+                <Wand2 className="w-3 h-3 mr-1" />
+                Limpiar terreno con AI
+              </>
+            )}
+          </Button>
+
+          {/* Individual obstacle list */}
+          <div className="space-y-1 max-h-48 overflow-y-auto">
+            {detectedObstacles.map((obs, idx) => (
+              <div
+                key={obs.id}
+                className="flex items-center justify-between bg-gray-50 rounded p-1.5 text-[10px] gap-1"
+              >
+                <div className="min-w-0 flex-1">
+                  <span className="font-medium text-gray-700 truncate block">
+                    {idx + 1}. {obs.label}
+                  </span>
+                  <span className="text-gray-400">
+                    {Math.round(obs.confidence * 100)}% confianza
+                  </span>
+                </div>
+                <div className="flex gap-1 shrink-0">
+                  {/* Erase from photo with AI */}
+                  <button
+                    onClick={() => handleInpaintObstacle(obs.id)}
+                    disabled={isInpainting}
+                    className="text-purple-600 hover:text-purple-800 disabled:opacity-40 p-0.5"
+                    title="Borrar de la foto con AI"
+                  >
+                    {inpaintingObstacleId === obs.id ? (
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <Wand2 className="w-3 h-3" />
+                    )}
+                  </button>
+                  {/* Remove marker only */}
+                  <button
+                    onClick={() => handleObstacleRemove(obs.id)}
+                    disabled={isInpainting}
+                    className="text-red-400 hover:text-red-600 disabled:opacity-40 p-0.5"
+                    title="Quitar marcador"
+                  >
+                    🗑
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  // ─── Quotation Panel ──────────────────────────────────────────────────────
+  const quotationJSX = (
+    <Card className="border-none shadow-sm bg-gradient-to-br from-green-50 to-emerald-50">
+      <CardHeader
+        className="pb-2 cursor-pointer"
+        onClick={() =>
+          device !== "desktop" && setShowQuotation(!showQuotation)
+        }
+      >
+        <CardTitle className="text-sm sm:text-base flex items-center justify-between text-green-800">
+          <span>Cotización en Tiempo Real</span>
+          {device !== "desktop" &&
+            (showQuotation ? (
+              <ChevronUp className="w-4 h-4" />
+            ) : (
+              <ChevronDown className="w-4 h-4" />
+            ))}
+        </CardTitle>
+      </CardHeader>
+      {(showQuotation || device === "desktop") && (
+        <CardContent className="space-y-2 pt-0">
+          <div className="space-y-1 text-xs sm:text-sm">
+            <div className="flex justify-between text-gray-600">
+              <span>Plantas ({plantCount}):</span>
+              <span className="font-semibold">
+                ${currentQuotation.plantsCost.toFixed(2)}
+              </span>
+            </div>
+            <div className="flex justify-between text-gray-600">
+              <span>Materiales:</span>
+              <span className="font-semibold">
+                ${currentQuotation.materialsCost.toFixed(2)}
+              </span>
+            </div>
+            <div className="flex justify-between text-gray-600">
+              <span>Mano de Obra:</span>
+              <span className="font-semibold">
+                ${currentQuotation.laborCost.toFixed(2)}
+              </span>
+            </div>
+            <div className="border-t pt-1 flex justify-between text-gray-600">
+              <span>Subtotal:</span>
+              <span className="font-semibold">
+                ${currentQuotation.totalCost.toFixed(2)}
+              </span>
+            </div>
+            <div className="flex justify-between text-gray-600">
+              <span>Margen (30%):</span>
+              <span className="font-semibold">
+                $
+                {(
+                  currentQuotation.totalCost * currentQuotation.margin
+                ).toFixed(2)}
+              </span>
+            </div>
+          </div>
+          <div className="border-t pt-2 flex justify-between items-center">
+            <span className="text-base sm:text-lg font-bold text-green-900">
+              Total:
+            </span>
+            <span className="text-xl sm:text-2xl font-bold text-green-600">
+              ${currentQuotation.finalPrice.toFixed(2)}
+            </span>
+          </div>
+        </CardContent>
+      )}
+    </Card>
+  );
+
+  // ─── Canvas ───────────────────────────────────────────────────────────────
+  const canvasJSX = (
+    <div
+      ref={canvasContainerRef}
+      className="w-full h-full min-h-[250px] sm:min-h-[350px] lg:min-h-[450px] relative"
+      onDrop={handleCanvasDrop}
+      onDragOver={(e) => e.preventDefault()}
+    >
+      {isInpainting && (
+        <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/40 rounded-lg">
+          <div className="bg-white rounded-xl p-4 flex flex-col items-center gap-2 shadow-xl">
+            <Loader2 className="w-8 h-8 animate-spin text-purple-600" />
+            <p className="text-sm font-medium text-gray-700">
+              AI limpiando el terreno...
+            </p>
+            <p className="text-xs text-gray-400">Esto puede tomar 10-20 seg</p>
+          </div>
+        </div>
+      )}
+      <ImprovedLiveCanvas
+        backgroundImage={backgroundImage}
+        objects={plantObjects}
+        obstacles={visibleObstacles}
+        onObjectsChange={handleObjectsChange}
+        onSelectionChange={(selected) => {
+          if (selected.length > 0) liveInteraction.selectObject(selected[0]);
+        }}
+        onObstacleDelete={handleObstacleRemove}
+      />
+    </div>
+  );
+
+  // ─── Render ───────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col h-full gap-4 p-4 bg-gray-50">
-      {/* Header con controles */}
-      <div className="flex items-center justify-between bg-white p-4 rounded-lg shadow-sm">
-        <div>
-          <h2 className="text-2xl font-bold text-gray-900">Ajustar Diseño en Vivo</h2>
-          <p className="text-gray-600 text-sm">
-            Modifica el diseño interactivamente con plantas del inventario real.
+    <div className="flex flex-col h-screen max-h-screen bg-gray-50 overflow-hidden">
+      {/* HEADER */}
+      <div className="flex items-center justify-between bg-white px-3 py-2 sm:px-4 sm:py-3 shadow-sm shrink-0 z-10">
+        <div className="min-w-0">
+          <h2 className="text-base sm:text-xl font-bold text-gray-900 truncate">
+            Ajustar Diseño
+          </h2>
+          <p className="text-gray-500 text-[10px] sm:text-xs hidden sm:block">
+            Arrastra plantas al canvas · Toca obstáculos para borrarlos con AI
           </p>
         </div>
-
-        <div className="flex gap-2">
+        <div className="flex gap-1 sm:gap-2 shrink-0">
           <Button
             variant="outline"
             size="sm"
             onClick={() => liveInteraction.undo()}
             disabled={liveInteraction.state.history.length === 0}
+            className="h-8 px-2 text-xs"
           >
-            <Undo2 className="w-4 h-4 mr-1" />
-            Deshacer
+            <Undo2 className="w-3 h-3 sm:mr-1" />
+            <span className="hidden sm:inline">Deshacer</span>
           </Button>
           <Button
             variant="outline"
             size="sm"
             onClick={() => liveInteraction.redo()}
-            disabled={liveInteraction.state.historyIndex >= liveInteraction.state.history.length - 1}
+            disabled={
+              liveInteraction.state.historyIndex >=
+              liveInteraction.state.history.length - 1
+            }
+            className="h-8 px-2 text-xs"
           >
-            <Redo2 className="w-4 h-4 mr-1" />
-            Rehacer
+            <Redo2 className="w-3 h-3 sm:mr-1" />
+            <span className="hidden sm:inline">Rehacer</span>
           </Button>
           <Button
             onClick={handleComplete}
             disabled={isSubmitting}
-            className="bg-green-600 hover:bg-green-700"
+            size="sm"
+            className="bg-green-600 hover:bg-green-700 h-8 px-2 sm:px-3 text-xs"
           >
-            <Save className="w-4 h-4 mr-1" />
-            {isSubmitting ? "Guardando..." : "Finalizar Diseño"}
+            <Save className="w-3 h-3 sm:mr-1" />
+            <span className="hidden sm:inline">
+              {isSubmitting ? "Guardando..." : "Finalizar"}
+            </span>
+            <span className="sm:hidden">{isSubmitting ? "..." : "OK"}</span>
           </Button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 flex-1 overflow-hidden">
-        {/* Main Content Area */}
-        <div className="lg:col-span-3 flex flex-col gap-4 overflow-hidden">
-          {/* Tabs de herramientas */}
-          <Tabs value={activeTab} onValueChange={(v) => setActiveTab(v as any)} className="flex-1 flex flex-col overflow-hidden">
-            <TabsList className="grid w-full grid-cols-3 bg-white">
-              <TabsTrigger value="canvas">Canvas</TabsTrigger>
-              <TabsTrigger value="materials">Materiales</TabsTrigger>
-              <TabsTrigger value="inventory" className="flex items-center gap-2">
-                <ShoppingBag className="w-4 h-4" />
-                Plantas (Inventario)
-              </TabsTrigger>
-            </TabsList>
+      {/* MAIN CONTENT */}
+      {device === "desktop" ? (
+        /* DESKTOP: 3-column */
+        <div className="flex-1 flex overflow-hidden">
+          {/* Left: obstacles */}
+          <div className="w-56 xl:w-64 bg-white border-r overflow-y-auto p-3 shrink-0">
+            {obstaclePanelJSX}
+          </div>
 
-            {/* Tab: Canvas */}
-            <TabsContent value="canvas" className="flex-1 mt-0 overflow-hidden">
-              <Card className="h-full border-none shadow-sm overflow-hidden">
-                <CardContent className="p-0 h-full relative bg-gray-200">
-                  <LiveInteractionCanvas
-                    width={800}
-                    height={600}
-                    objects={designSync.designState.objects.map(obj => ({
-                      ...obj,
-                      radius: 20,
-                    }))}
-                    onObjectsChange={(objs) => {
-                      // Sincronizar cambios de posición si es necesario
-                    }}
-                    onSelectionChange={(selected) => {
-                      if (selected.length > 0) {
-                        handleSelectObject(selected[0]);
-                      }
-                    }}
-                  />
-                  <FloatingControls
-                    x={liveInteraction.state.floatingControlsX || 0}
-                    y={liveInteraction.state.floatingControlsY || 0}
-                    selectedObject={liveInteraction.state.selectedObjects[0] || null}
-                    onDelete={handleDeleteObject}
-                    onDuplicate={handleDuplicateObject}
-                    onChangeType={handleChangeObjectType}
-                    isVisible={liveInteraction.state.showFloatingControls}
-                  />
-                </CardContent>
-              </Card>
-            </TabsContent>
+          {/* Center: canvas + tabs */}
+          <div className="flex-1 flex flex-col overflow-hidden">
+            <Tabs
+              value={activeTab}
+              onValueChange={(v) => setActiveTab(v as any)}
+              className="flex-1 flex flex-col overflow-hidden"
+            >
+              <TabsList className="grid w-full grid-cols-3 bg-white border-b rounded-none h-9">
+                <TabsTrigger value="canvas" className="text-xs">
+                  Canvas
+                </TabsTrigger>
+                <TabsTrigger value="materials" className="text-xs">
+                  Materiales
+                </TabsTrigger>
+                <TabsTrigger
+                  value="inventory"
+                  className="text-xs flex items-center gap-1"
+                >
+                  <ShoppingBag className="w-3 h-3" /> Plantas
+                </TabsTrigger>
+              </TabsList>
 
-            {/* Tab: Materiales */}
-            <TabsContent value="materials" className="flex-1 mt-0 overflow-auto">
-              <Card className="h-full border-none shadow-sm">
-                <CardHeader>
-                  <CardTitle>Editor de Materiales</CardTitle>
-                  <CardDescription>
-                    Cambia materiales de terreno (pasto, tierra, concreto, grava)
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <MaterialEditor
-                    onApplyMaterial={handleApplyMaterial}
-                    onCleanArea={() => {}}
-                  />
-                </CardContent>
-              </Card>
-            </TabsContent>
+              <TabsContent
+                value="canvas"
+                className="flex-1 mt-0 overflow-hidden p-2"
+              >
+                {canvasJSX}
+              </TabsContent>
 
-            {/* Tab: Inventario */}
-            <TabsContent value="inventory" className="flex-1 mt-0 overflow-hidden">
-              <Card className="h-full border-none shadow-sm overflow-hidden">
+              <TabsContent
+                value="materials"
+                className="flex-1 mt-0 overflow-auto p-4"
+              >
+                <MaterialEditor onApplyMaterial={() => {}} onCleanArea={() => {}} />
+              </TabsContent>
+
+              <TabsContent
+                value="inventory"
+                className="flex-1 mt-0 overflow-hidden"
+              >
                 <InventoryPanel
                   onSelectPlant={handleSelectPlantFromInventory}
                   showCart={false}
                 />
-              </Card>
+              </TabsContent>
+            </Tabs>
+          </div>
+
+          {/* Right: quotation + notes */}
+          <div className="w-56 xl:w-64 bg-white border-l overflow-y-auto p-3 shrink-0 space-y-3">
+            {quotationJSX}
+            <Card className="border-none shadow-sm">
+              <CardHeader className="pb-1">
+                <CardTitle className="text-xs font-semibold">Notas</CardTitle>
+              </CardHeader>
+              <CardContent>
+                <textarea
+                  className="w-full p-2 text-xs border rounded-md focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                  rows={3}
+                  placeholder="Notas del diseño..."
+                  value={userNotes}
+                  onChange={(e) => setUserNotes(e.target.value)}
+                />
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      ) : device === "tablet" ? (
+        /* TABLET: canvas + right sidebar */
+        <div className="flex-1 flex overflow-hidden">
+          <div className="flex-1 flex flex-col overflow-hidden">
+            <Tabs
+              value={activeTab}
+              onValueChange={(v) => setActiveTab(v as any)}
+              className="flex-1 flex flex-col overflow-hidden"
+            >
+              <TabsList className="grid w-full grid-cols-3 bg-white border-b rounded-none h-9">
+                <TabsTrigger value="canvas" className="text-xs">
+                  Canvas
+                </TabsTrigger>
+                <TabsTrigger value="materials" className="text-xs">
+                  Materiales
+                </TabsTrigger>
+                <TabsTrigger
+                  value="inventory"
+                  className="text-xs flex items-center gap-1"
+                >
+                  <ShoppingBag className="w-3 h-3" /> Plantas
+                </TabsTrigger>
+              </TabsList>
+
+              <TabsContent
+                value="canvas"
+                className="flex-1 mt-0 overflow-hidden p-2"
+              >
+                {canvasJSX}
+              </TabsContent>
+
+              <TabsContent
+                value="materials"
+                className="flex-1 mt-0 overflow-auto p-3"
+              >
+                <MaterialEditor onApplyMaterial={() => {}} onCleanArea={() => {}} />
+              </TabsContent>
+
+              <TabsContent
+                value="inventory"
+                className="flex-1 mt-0 overflow-hidden"
+              >
+                <InventoryPanel
+                  onSelectPlant={handleSelectPlantFromInventory}
+                  showCart={false}
+                />
+              </TabsContent>
+            </Tabs>
+          </div>
+
+          <div className="w-52 bg-white border-l overflow-y-auto p-2 shrink-0 space-y-2">
+            {obstaclePanelJSX}
+            {quotationJSX}
+          </div>
+        </div>
+      ) : (
+        /* MOBILE: stacked */
+        <div className="flex-1 overflow-y-auto">
+          <div className="p-2">{canvasJSX}</div>
+          <div className="px-2 pb-2">{quotationJSX}</div>
+          <Tabs
+            value={activeTab}
+            onValueChange={(v) => setActiveTab(v as any)}
+            className="px-2 pb-2"
+          >
+            <TabsList className="grid w-full grid-cols-3 bg-white h-9">
+              <TabsTrigger value="canvas" className="text-[10px]">
+                Obstáculos
+              </TabsTrigger>
+              <TabsTrigger value="materials" className="text-[10px]">
+                Materiales
+              </TabsTrigger>
+              <TabsTrigger
+                value="inventory"
+                className="text-[10px] flex items-center gap-1"
+              >
+                <ShoppingBag className="w-3 h-3" /> Plantas
+              </TabsTrigger>
+            </TabsList>
+
+            <TabsContent value="canvas" className="mt-2">
+              {obstaclePanelJSX}
+            </TabsContent>
+
+            <TabsContent value="materials" className="mt-2">
+              <MaterialEditor onApplyMaterial={() => {}} onCleanArea={() => {}} />
+            </TabsContent>
+
+            <TabsContent value="inventory" className="mt-2">
+              <InventoryPanel
+                onSelectPlant={handleSelectPlantFromInventory}
+                showCart={false}
+              />
             </TabsContent>
           </Tabs>
         </div>
+      )}
 
-        {/* Sidebar: Cotización en tiempo real */}
-        <div className="lg:col-span-1 flex flex-col gap-4 overflow-auto">
-          <Card className="border-none shadow-sm bg-gradient-to-br from-green-50 to-emerald-50">
-            <CardHeader>
-              <CardTitle className="text-lg flex items-center gap-2 text-green-800">
-                Cotización en Tiempo Real
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm text-gray-600">
-                  <span>Plantas ({designSync.designState.objects.length}):</span>
-                  <span className="font-semibold text-gray-900">${currentQuotation.plantsCost.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between text-sm text-gray-600">
-                  <span>Materiales:</span>
-                  <span className="font-semibold text-gray-900">${currentQuotation.materialsCost.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between text-sm text-gray-600">
-                  <span>Mano de Obra:</span>
-                  <span className="font-semibold text-gray-900">${currentQuotation.laborCost.toFixed(2)}</span>
-                </div>
-                <div className="border-t border-green-200 pt-2 flex justify-between text-sm text-gray-600">
-                  <span>Subtotal:</span>
-                  <span className="font-semibold text-gray-900">${currentQuotation.totalCost.toFixed(2)}</span>
-                </div>
-                <div className="flex justify-between text-sm text-gray-600">
-                  <span>Margen (30%):</span>
-                  <span className="font-semibold text-gray-900">${(currentQuotation.totalCost * currentQuotation.margin).toFixed(2)}</span>
-                </div>
-              </div>
-
-              <div className="border-t border-green-300 pt-4">
-                <div className="flex justify-between items-center">
-                  <span className="text-xl font-bold text-green-900">Total:</span>
-                  <span className="text-3xl font-bold text-green-600">
-                    ${currentQuotation.finalPrice.toFixed(2)}
-                  </span>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="border-none shadow-sm">
-            <CardHeader>
-              <CardTitle className="text-sm font-semibold">Notas del Diseño</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <textarea
-                className="w-full p-2 text-sm border rounded-md focus:ring-2 focus:ring-blue-500 outline-none"
-                rows={4}
-                placeholder="Añade notas sobre los cambios realizados..."
-                value={userNotes}
-                onChange={(e) => setUserNotes(e.target.value)}
-              />
-            </CardContent>
-          </Card>
-        </div>
-      </div>
+      {/* AI ASSISTANT */}
+      <AIDesignAssistant
+        projectId={projectId}
+        obstacles={detectedObstacles}
+        onDetectObstacles={handleDetect}
+        onRemoveObstacle={handleObstacleRemove}
+        onClearAllObstacles={handleClearAllObstacles}
+        onRemoveObstacleByName={(name: string) => {
+          setDetectedObstacles((prev) => {
+            const nameLower = name.toLowerCase();
+            return prev.filter(
+              (o) => !o.label.toLowerCase().includes(nameLower)
+            );
+          });
+        }}
+        onKeepObstaclesByName={(names: string[]) => {
+          setDetectedObstacles((prev) =>
+            prev.filter((o) =>
+              names.some((n) =>
+                o.label.toLowerCase().includes(n.toLowerCase())
+              )
+            )
+          );
+        }}
+        onInpaintAll={handleInpaintAll}
+        captureImage={backgroundImage}
+      />
     </div>
   );
 };

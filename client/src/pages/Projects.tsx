@@ -73,21 +73,22 @@ export default function Projects() {
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-50">
       {/* Header */}
       <header className="bg-white border-b border-gray-200">
-        <div className="max-w-6xl mx-auto px-4 py-6 flex items-center justify-between">
-          <div className="flex items-center gap-4">
+        <div className="max-w-6xl mx-auto px-4 py-4 md:py-6 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 md:gap-0">
+          <div className="flex items-center gap-2 md:gap-4 w-full md:w-auto">
             <Button
               variant="ghost"
               size="sm"
               onClick={() => window.location.href = "/"}
+              className="shrink-0"
             >
               <ArrowLeft className="w-4 h-4" />
             </Button>
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900">Mis Proyectos</h1>
-              <p className="text-sm text-gray-600">Gestiona tus proyectos de paisajismo</p>
+            <div className="flex-1">
+              <h1 className="text-xl md:text-2xl font-bold text-gray-900">Mis Proyectos</h1>
+              <p className="text-xs md:text-sm text-gray-600">Gestiona tus proyectos de paisajismo</p>
             </div>
           </div>
-          <Button onClick={() => window.location.href = "/projects/new"}>
+          <Button className="w-full md:w-auto" onClick={() => window.location.href = "/projects/new"}>
             <Plus className="w-4 h-4 mr-2" />
             Nuevo Proyecto
           </Button>

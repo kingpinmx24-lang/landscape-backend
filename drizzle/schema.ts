@@ -8,8 +8,25 @@ import {
   pgTable,
   decimal,
   index,
+  serial,
 } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
+
+// Enum definitions
+const userRoleEnum = pgEnum("role", ["user", "admin"]);
+const projectStatusEnum = pgEnum("project_status", ["draft", "active", "completed", "archived"]);
+const quotationStatusEnum = pgEnum("quotation_status", [
+  "draft",
+  "sent",
+  "accepted",
+  "rejected",
+  "completed",
+]);
+const plantTypeEnum = pgEnum("plant_type", ["tree", "shrub", "flower", "grass", "groundcover"]);
+const lightRequirementEnum = pgEnum("light_requirement", ["full", "partial", "shade"]);
+const waterRequirementEnum = pgEnum("water_requirement", ["low", "medium", "high"]);
+
+export { userRoleEnum, projectStatusEnum, quotationStatusEnum, plantTypeEnum, lightRequirementEnum, waterRequirementEnum };
 
 /**
  * ============================================================================
@@ -29,7 +46,7 @@ export const users = pgTable(
     name: text("name"),
     email: varchar("email", { length: 320 }),
     loginMethod: varchar("loginMethod", { length: 64 }),
-    role: pgEnum("role", ["user", "admin"]).default("user").notNull(),
+    role: userRoleEnum("role").default("user").notNull(),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
     updatedAt: timestamp("updatedAt").defaultNow().notNull(),
     lastSignedIn: timestamp("lastSignedIn").defaultNow().notNull(),
@@ -58,9 +75,7 @@ export const projects = pgTable(
     // Terrain data stored as JSON: { width, height, unit, type, etc. }
     terrain: jsonb("terrain").notNull(),
     // Project status: draft, active, completed, archived
-    status: pgEnum("project_status", ["draft", "active", "completed", "archived"])
-      .default("draft")
-      .notNull(),
+    status: projectStatusEnum("project_status").default("draft").notNull(),
     // Metadata: tags, notes, custom fields
     metadata: jsonb("metadata"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -142,15 +157,7 @@ export const quotations = pgTable(
     totalCost: decimal("totalCost", { precision: 12, scale: 2 }).notNull(),
     // Quotation items: array of { description, quantity, unitPrice, subtotal }
     items: jsonb("items").notNull(),
-    status: pgEnum("quotation_status", [
-      "draft",
-      "sent",
-      "accepted",
-      "rejected",
-      "completed",
-    ])
-      .default("draft")
-      .notNull(),
+    status: quotationStatusEnum("quotation_status").default("draft").notNull(),
     // Metadata: notes, discount, tax, etc.
     metadata: jsonb("metadata"),
     createdAt: timestamp("createdAt").defaultNow().notNull(),
@@ -163,6 +170,37 @@ export const quotations = pgTable(
 
 export type Quotation = typeof quotations.$inferSelect;
 export type InsertQuotation = typeof quotations.$inferInsert;
+
+/**
+ * Inventory Items table - Master list of plants available in the inventory
+ */
+export const inventoryItems = pgTable(
+  "inventory_items",
+  {
+    id: serial("id").primaryKey(),
+    name: varchar("name", { length: 255 }).notNull(),
+    scientificName: varchar("scientificName", { length: 255 }),
+    type: plantTypeEnum("plant_type").notNull(),
+    price: decimal("price", { precision: 10, scale: 2 }).notNull(),
+    stock: integer("stock").notNull().default(0),
+    minStock: integer("minStock").notNull().default(0),
+    imageUrl: text("imageUrl"),
+    description: text("description"),
+    lightRequirement: lightRequirementEnum("light_requirement"),
+    waterRequirement: waterRequirementEnum("water_requirement"),
+    matureHeight: decimal("matureHeight", { precision: 5, scale: 2 }),
+    matureWidth: decimal("matureWidth", { precision: 5, scale: 2 }),
+    minSpacing: decimal("minSpacing", { precision: 5, scale: 2 }),
+    createdAt: timestamp("createdAt").defaultNow().notNull(),
+    updatedAt: timestamp("updatedAt").defaultNow().notNull(),
+  },
+  (table) => ({
+    nameIdx: index("inventory_items_name_idx").on(table.name),
+  })
+);
+
+export type InventoryItem = typeof inventoryItems.$inferSelect;
+export type InsertInventoryItem = typeof inventoryItems.$inferInsert;
 
 /**
  * ============================================================================

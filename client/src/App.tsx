@@ -36,6 +36,40 @@ const DEFAULT_DESIGN: DesignData = {
   timestamp: Date.now(),
 };
 
+/**
+ * Utility: resolve the capture image from all possible storage locations.
+ * Priority:
+ *   1. Separate key `captureImage_${id}` (most reliable, avoids quota issues)
+ *   2. `project.captureImage` if it's a real data URL (not the placeholder)
+ *   3. `project.capture.imageUrl` or `project.capture.imageBase64` (legacy)
+ */
+function resolveCaptureImage(projectId: string, project: any): string | undefined {
+  // 1. Separate key
+  const separate = localStorage.getItem(`captureImage_${projectId}`);
+  if (separate && separate.startsWith("data:")) {
+    return separate;
+  }
+
+  // 2. Inline in project (if not the placeholder marker)
+  if (
+    project.captureImage &&
+    typeof project.captureImage === "string" &&
+    project.captureImage.startsWith("data:")
+  ) {
+    return project.captureImage;
+  }
+
+  // 3. Legacy capture object
+  if (project.capture?.imageUrl && project.capture.imageUrl.startsWith("data:")) {
+    return project.capture.imageUrl;
+  }
+  if (project.capture?.imageBase64 && project.capture.imageBase64.startsWith("data:")) {
+    return project.capture.imageBase64;
+  }
+
+  return undefined;
+}
+
 function AdjustLivePageRoute() {
   const [, params] = useRoute("/projects/:id/adjust");
   const [, setLocation] = useLocation();
@@ -63,10 +97,16 @@ function AdjustLivePageRoute() {
     );
   }
 
+  const captureImage = resolveCaptureImage(projectId, project);
+  console.log("[AdjustLivePageRoute] captureImage resolved:", captureImage ? `${captureImage.length} chars` : "NONE");
+
   return (
     <AdjustLiveStep
       projectId={projectId}
-      initialDesign={project.design || DEFAULT_DESIGN}
+      initialDesign={{
+        ...(project.design || DEFAULT_DESIGN),
+        captureImage,
+      }}
       onComplete={(adjustmentData) => {
         const updatedProject = {
           ...project,

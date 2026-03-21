@@ -1,6 +1,6 @@
 {
-  "id": "a889c31f-470d-4e6d-9fa2-4aee0654db19",
-  "prevId": "00000000-0000-0000-0000-000000000000",
+  "id": "8071a9d4-1fc2-4868-bdc1-2fd84beccaeb",
+  "prevId": "a889c31f-470d-4e6d-9fa2-4aee0654db19",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -62,12 +62,6 @@
         "description": {
           "name": "description",
           "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "climate": {
-          "name": "climate",
-          "type": "varchar(255)",
           "primaryKey": false,
           "notNull": false
         },
