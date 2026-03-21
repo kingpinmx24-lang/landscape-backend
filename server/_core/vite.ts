@@ -1,12 +1,18 @@
 import express, { type Express } from "express";
 import fs from "fs";
 import { type Server } from "http";
-import { nanoid } from "nanoid";
 import path from "path";
-import { createServer as createViteServer } from "vite";
-import viteConfig from "../../vite.config";
 
+// setupVite uses dynamic imports so that 'vite' and its plugins are NOT statically
+// imported. This prevents ERR_MODULE_NOT_FOUND in production where vite is a devDependency.
 export async function setupVite(app: Express, server: Server) {
+  // Dynamic imports — only resolved at runtime in development
+  const [{ createServer: createViteServer }, { nanoid }, { jsxLocPlugin }] = await Promise.all([
+    import("vite"),
+    import("nanoid"),
+    import("@builder.io/vite-plugin-jsx-loc"),
+  ]);
+
   const serverOptions = {
     middlewareMode: true,
     hmr: { server },
@@ -14,7 +20,7 @@ export async function setupVite(app: Express, server: Server) {
   };
 
   const vite = await createViteServer({
-    ...viteConfig,
+    plugins: [jsxLocPlugin()],
     configFile: false,
     server: serverOptions,
     appType: "custom",
@@ -49,19 +55,20 @@ export async function setupVite(app: Express, server: Server) {
 
 export function serveStatic(app: Express) {
   // In production (Render), the esbuild output is at dist/index.js
-  // and the Vite client build is at dist/ (same folder)
-  // We try multiple paths to find the built client assets
+  // The Vite client build is also at dist/ (same folder)
+  // We try multiple candidate paths to find the built client assets
   const candidatePaths = [
+    path.resolve(import.meta.dirname, ".."),               // dist/ (server bundle is dist/index.js)
     path.resolve(import.meta.dirname, "public"),           // dist/public (legacy)
-    path.resolve(import.meta.dirname, ".."),               // dist/ (when server is dist/index.js)
     path.resolve(process.cwd(), "dist"),                   // cwd/dist
     path.resolve(process.cwd(), "public"),                 // cwd/public
   ];
   const distPath = candidatePaths.find(p => fs.existsSync(path.join(p, "index.html"))) ||
     candidatePaths[0];
+
   if (!fs.existsSync(path.join(distPath, "index.html"))) {
     console.warn(
-      `[serveStatic] Could not find index.html in any candidate path. Tried: ${candidatePaths.join(', ')}`
+      `[serveStatic] Could not find index.html. Tried: ${candidatePaths.join(', ')}`
     );
   } else {
     console.log(`[serveStatic] Serving static files from: ${distPath}`);
