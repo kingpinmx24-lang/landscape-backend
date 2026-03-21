@@ -7,13 +7,15 @@
  * POST /api/inpaint
  * Body: { imageBase64: string, obstacles: Array<{x,y,width,height,label}> }
  * Returns: { imageBase64: string }
+ *
+ * Uses pngjs (pure JavaScript, no native dependencies) for mask generation.
+ * This avoids the node-canvas native compilation issues on Render.
  */
-
 import express from "express";
-import { createCanvas, loadImage } from "canvas";
 import OpenAI from "openai";
 import { toFile } from "openai/uploads";
 import { Readable } from "stream";
+import { PNG } from "pngjs";
 
 const router = express.Router();
 
@@ -40,83 +42,92 @@ function base64ToBuffer(base64: string): Buffer {
 }
 
 /**
- * Create a mask image: white = area to inpaint, black = keep
- * DALL-E 2 requires: transparent = inpaint, opaque = keep
- * We use PNG with alpha channel: alpha=0 (transparent) = inpaint area
+ * Create a mask PNG using pngjs (pure JS, no native deps).
+ * DALL-E 2 requires: transparent alpha = inpaint, opaque = keep
  */
-async function createMask(
-  imageBase64: string,
+function createMask(
+  imageWidth: number,
+  imageHeight: number,
   obstacles: ObstacleBox[]
-): Promise<Buffer> {
-  // Load original image to get real dimensions
-  const imgBuffer = base64ToBuffer(imageBase64);
-  const img = await loadImage(imgBuffer);
-  const W = img.width;
-  const H = img.height;
+): Buffer {
+  const png = new PNG({ width: imageWidth, height: imageHeight, filterType: -1 });
 
-  // Create canvas with same dimensions
-  const canvas = createCanvas(W, H);
-  const ctx = canvas.getContext("2d");
+  // Fill with fully opaque black = keep everything
+  for (let y = 0; y < imageHeight; y++) {
+    for (let x = 0; x < imageWidth; x++) {
+      const idx = (imageWidth * y + x) << 2;
+      png.data[idx] = 0;       // R
+      png.data[idx + 1] = 0;   // G
+      png.data[idx + 2] = 0;   // B
+      png.data[idx + 3] = 255; // A = fully opaque (keep)
+    }
+  }
 
-  // Fill with black (opaque = keep everything)
-  ctx.fillStyle = "rgba(0, 0, 0, 255)";
-  ctx.fillRect(0, 0, W, H);
-
-  // For each obstacle, make that area transparent (= inpaint)
   // Scale from internal 800x600 to real image dimensions
-  const scaleX = W / 800;
-  const scaleY = H / 600;
+  const scaleX = imageWidth / 800;
+  const scaleY = imageHeight / 600;
 
-  obstacles.forEach((obs) => {
-    const x = (obs.x - obs.width / 2) * scaleX;
-    const y = (obs.y - obs.height / 2) * scaleY;
-    const w = obs.width * scaleX;
-    const h = obs.height * scaleY;
+  // Mark obstacle areas as fully transparent = inpaint here
+  for (const obs of obstacles) {
+    const cx = obs.x * scaleX;
+    const cy = obs.y * scaleY;
+    const hw = (obs.width * scaleX) / 2;
+    const hh = (obs.height * scaleY) / 2;
 
-    // Add 15% padding to ensure full coverage
-    const padX = w * 0.15;
-    const padY = h * 0.15;
+    // Add 15% padding for full coverage
+    const padX = hw * 0.15;
+    const padY = hh * 0.15;
 
-    ctx.clearRect(
-      Math.max(0, x - padX),
-      Math.max(0, y - padY),
-      Math.min(W - Math.max(0, x - padX), w + padX * 2),
-      Math.min(H - Math.max(0, y - padY), h + padY * 2)
-    );
-  });
+    const x1 = Math.max(0, Math.floor(cx - hw - padX));
+    const y1 = Math.max(0, Math.floor(cy - hh - padY));
+    const x2 = Math.min(imageWidth, Math.ceil(cx + hw + padX));
+    const y2 = Math.min(imageHeight, Math.ceil(cy + hh + padY));
 
-  return canvas.toBuffer("image/png");
+    for (let py = y1; py < y2; py++) {
+      for (let px = x1; px < x2; px++) {
+        const idx = (imageWidth * py + px) << 2;
+        png.data[idx] = 0;     // R
+        png.data[idx + 1] = 0; // G
+        png.data[idx + 2] = 0; // B
+        png.data[idx + 3] = 0; // A = fully transparent (inpaint here)
+      }
+    }
+  }
+
+  return PNG.sync.write(png);
 }
 
 /**
- * Resize image to 1024x1024 as required by DALL-E 2 edit
+ * Resize a PNG buffer to targetSize x targetSize using nearest-neighbor sampling.
+ * DALL-E 2 requires square images: 256x256, 512x512, or 1024x1024.
  */
-async function resizeTo1024(imageBase64: string): Promise<Buffer> {
-  const imgBuffer = base64ToBuffer(imageBase64);
-  const img = await loadImage(imgBuffer);
+function resizePng(
+  inputBuffer: Buffer,
+  targetSize: number
+): Buffer {
+  const src = PNG.sync.read(inputBuffer);
+  const dst = new PNG({ width: targetSize, height: targetSize, filterType: -1 });
 
-  const canvas = createCanvas(1024, 1024);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, 1024, 1024);
+  for (let y = 0; y < targetSize; y++) {
+    for (let x = 0; x < targetSize; x++) {
+      const srcX = Math.floor((x / targetSize) * src.width);
+      const srcY = Math.floor((y / targetSize) * src.height);
+      const srcIdx = (src.width * srcY + srcX) << 2;
+      const dstIdx = (targetSize * y + x) << 2;
+      dst.data[dstIdx] = src.data[srcIdx];
+      dst.data[dstIdx + 1] = src.data[srcIdx + 1];
+      dst.data[dstIdx + 2] = src.data[srcIdx + 2];
+      dst.data[dstIdx + 3] = src.data[srcIdx + 3] ?? 255;
+    }
+  }
 
-  return canvas.toBuffer("image/png");
-}
-
-/**
- * Resize mask to 1024x1024
- */
-async function resizeMaskTo1024(maskBuffer: Buffer): Promise<Buffer> {
-  const img = await loadImage(maskBuffer);
-  const canvas = createCanvas(1024, 1024);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, 1024, 1024);
-  return canvas.toBuffer("image/png");
+  return PNG.sync.write(dst);
 }
 
 /**
  * Buffer to OpenAI File
  */
-async function bufferToFile(buffer: Buffer, filename: string): Promise<any> {
+async function bufferToFile(buffer: Buffer, filename: string): Promise<ReturnType<typeof toFile>> {
   const stream = Readable.from(buffer);
   return toFile(stream, filename, { type: "image/png" });
 }
@@ -129,19 +140,25 @@ router.post("/", async (req, res) => {
     };
 
     if (!imageBase64 || !obstacles || obstacles.length === 0) {
-      return res.status(400).json({ error: "imageBase64 and obstacles are required" });
+      res.status(400).json({ error: "imageBase64 and obstacles are required" });
+      return;
     }
 
     console.log(`[Inpaint] Processing ${obstacles.length} obstacles...`);
 
-    // 1. Create mask
-    const maskBuffer = await createMask(imageBase64, obstacles);
+    // 1. Parse original image to get dimensions
+    const origBuffer = base64ToBuffer(imageBase64);
+    const origPng = PNG.sync.read(origBuffer);
+    const { width: origW, height: origH } = origPng;
 
-    // 2. Resize both image and mask to 1024x1024 (DALL-E 2 requirement)
-    const imageBuffer1024 = await resizeTo1024(imageBase64);
-    const maskBuffer1024 = await resizeMaskTo1024(maskBuffer);
+    // 2. Create mask at original dimensions
+    const maskBuffer = createMask(origW, origH, obstacles);
 
-    // 3. Call OpenAI DALL-E 2 edit
+    // 3. Resize both image and mask to 1024x1024 (DALL-E 2 requirement)
+    const imageBuffer1024 = resizePng(origBuffer, 1024);
+    const maskBuffer1024 = resizePng(maskBuffer, 1024);
+
+    // 4. Call OpenAI DALL-E 2 edit
     const imageFile = await bufferToFile(imageBuffer1024, "image.png");
     const maskFile = await bufferToFile(maskBuffer1024, "mask.png");
 
@@ -164,13 +181,13 @@ router.post("/", async (req, res) => {
 
     console.log(`[Inpaint] Success! Returning cleaned image.`);
 
-    return res.json({
+    res.json({
       imageBase64: `data:image/png;base64,${resultBase64}`,
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     console.error("[Inpaint] Error:", msg);
-    return res.status(500).json({ error: msg });
+    res.status(500).json({ error: msg });
   }
 });
 
