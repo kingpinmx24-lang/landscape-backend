@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import { createServer } from "http";
 import net from "net";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
@@ -31,12 +32,26 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
 async function startServer() {
   const app = express();
   const server = createServer(app);
+
+  // Enable CORS for frontend connection (Vercel)
+  app.use(cors({
+    origin: true,
+    credentials: true,
+  }));
+
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+  // Health check endpoint (required for Render deployment verification)
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);
-  // Inpainting API
+
+  // AI Inpainting API (DALL-E 2 obstacle removal)
   app.use("/api/inpaint", inpaintRouter);
 
   // tRPC API
@@ -47,15 +62,12 @@ async function startServer() {
       createContext,
     })
   );
-  // Health check endpoint (required for Render)
-  app.get("/health", (_req, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
 
-  // development mode uses Vite, production mode uses static files
+  // Development mode uses Vite for local development
   if (process.env.NODE_ENV === "development") {
     await setupVite(app, server);
-  } else {
-    serveStatic(app);
   }
+  // Production mode: Backend only exposes API. Frontend is deployed separately on Vercel.
 
   const preferredPort = parseInt(process.env.PORT || "3000");
   const port = await findAvailablePort(preferredPort);
