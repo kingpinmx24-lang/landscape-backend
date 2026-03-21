@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: landscape-backend
+    runtime: node
+    buildCommand: pnpm install && pnpm run build:client && pnpm run build:server
+    startCommand: pnpm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000

@@ -48,14 +48,23 @@ export async function setupVite(app: Express, server: Server) {
 }
 
 export function serveStatic(app: Express) {
-  const distPath =
-    process.env.NODE_ENV === "development"
-      ? path.resolve(import.meta.dirname, "../..", "dist", "public")
-      : path.resolve(import.meta.dirname, "public");
-  if (!fs.existsSync(distPath)) {
-    console.error(
-      `Could not find the build directory: ${distPath}, make sure to build the client first`
+  // In production (Render), the esbuild output is at dist/index.js
+  // and the Vite client build is at dist/ (same folder)
+  // We try multiple paths to find the built client assets
+  const candidatePaths = [
+    path.resolve(import.meta.dirname, "public"),           // dist/public (legacy)
+    path.resolve(import.meta.dirname, ".."),               // dist/ (when server is dist/index.js)
+    path.resolve(process.cwd(), "dist"),                   // cwd/dist
+    path.resolve(process.cwd(), "public"),                 // cwd/public
+  ];
+  const distPath = candidatePaths.find(p => fs.existsSync(path.join(p, "index.html"))) ||
+    candidatePaths[0];
+  if (!fs.existsSync(path.join(distPath, "index.html"))) {
+    console.warn(
+      `[serveStatic] Could not find index.html in any candidate path. Tried: ${candidatePaths.join(', ')}`
     );
+  } else {
+    console.log(`[serveStatic] Serving static files from: ${distPath}`);
   }
 
   app.use(express.static(distPath));
