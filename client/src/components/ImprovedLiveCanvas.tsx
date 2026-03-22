@@ -2,7 +2,7 @@
  * Component: ImprovedLiveCanvas
  * ============================================================================
  * Production-grade canvas with:
- * - ERASER MODE: swipe/drag finger over obstacles to erase them instantly
+ * - FREEHAND PAINT ERASER: user paints mask with finger/mouse → AI inpainting
  * - HTML overlay divs for obstacles (native click/touch, no coordinate math)
  * - Canvas only draws background + plants
  * - Responsive: adapts to container via ResizeObserver
@@ -13,6 +13,7 @@
 import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { SelectedObject } from "../../../shared/live-interaction-types";
 import { Obstacle } from "./ObstacleDetector";
+import { Loader2 } from "lucide-react";
 
 interface ImprovedLiveCanvasProps {
   backgroundImage?: string;
@@ -21,6 +22,7 @@ interface ImprovedLiveCanvasProps {
   onObjectsChange?: (objects: SelectedObject[]) => void;
   onSelectionChange?: (selected: SelectedObject[]) => void;
   onObstacleDelete?: (obstacleId: string) => void;
+  onInpaintMask?: (imageBase64: string, maskBase64: string) => Promise<string>;
   gridSize?: number;
   snapToGrid?: boolean;
 }
@@ -32,12 +34,14 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
   onObjectsChange,
   onSelectionChange,
   onObstacleDelete,
+  onInpaintMask,
   gridSize = 20,
   snapToGrid = false,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
 
   // Internal canvas resolution
   const INTERNAL_W = 800;
@@ -49,10 +53,19 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
   const [backgroundImg, setBackgroundImg] = useState<HTMLImageElement | null>(null);
   const [imageCache] = useState<Map<string, HTMLImageElement>>(new Map());
   const objectsRef = useRef<SelectedObject[]>(objects);
-  const [eraserMode, setEraserMode] = useState(false);
+
+  // Eraser modes: "none" | "obstacle" | "paint"
+  const [eraserMode, setEraserMode] = useState<"none" | "obstacle" | "paint">("none");
+  const [brushSize, setBrushSize] = useState(40);
+  const [isPainting, setIsPainting] = useState(false);
+  const [hasMask, setHasMask] = useState(false);
+  const [isApplying, setIsApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
+
   // Track which obstacles are being erased (for animation)
   const [erasingIds, setErasingIds] = useState<Set<string>>(new Set());
   const eraserActiveRef = useRef(false);
+  const isPaintingRef = useRef(false);
 
   useEffect(() => {
     objectsRef.current = objects;
@@ -85,6 +98,16 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
     });
   }, [objects, imageCache]);
 
+  // ─── Initialize mask canvas ───
+  useEffect(() => {
+    const mask = maskCanvasRef.current;
+    if (!mask) return;
+    const ctx = mask.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, INTERNAL_W, INTERNAL_H);
+    setHasMask(false);
+  }, [backgroundImage]); // Reset mask when image changes
+
   // ─── Canvas coordinate helpers ───
   const getCanvasCoords = useCallback((clientX: number, clientY: number) => {
     const canvas = canvasRef.current;
@@ -97,6 +120,79 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
       y: (clientY - rect.top) * scaleY,
     };
   }, []);
+
+  // ─── Paint mask stroke ───
+  const paintMaskAt = useCallback((clientX: number, clientY: number) => {
+    const mask = maskCanvasRef.current;
+    if (!mask) return;
+    const ctx = mask.getContext("2d");
+    if (!ctx) return;
+    const { x, y } = getCanvasCoords(clientX, clientY);
+    ctx.globalCompositeOperation = "source-over";
+    ctx.fillStyle = "white";
+    ctx.beginPath();
+    ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
+    ctx.fill();
+    setHasMask(true);
+  }, [getCanvasCoords, brushSize]);
+
+  // ─── Clear mask ───
+  const clearMask = useCallback(() => {
+    const mask = maskCanvasRef.current;
+    if (!mask) return;
+    const ctx = mask.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, INTERNAL_W, INTERNAL_H);
+    setHasMask(false);
+    setApplyError(null);
+  }, []);
+
+  // ─── Apply inpainting ───
+  const applyInpaint = useCallback(async () => {
+    if (!hasMask || !backgroundImage || !onInpaintMask) return;
+    const mask = maskCanvasRef.current;
+    const mainCanvas = canvasRef.current;
+    if (!mask || !mainCanvas) return;
+
+    setIsApplying(true);
+    setApplyError(null);
+
+    try {
+      // Get the background image as base64 from the canvas
+      const bgCanvas = document.createElement("canvas");
+      bgCanvas.width = INTERNAL_W;
+      bgCanvas.height = INTERNAL_H;
+      const bgCtx = bgCanvas.getContext("2d");
+      if (!bgCtx) throw new Error("No canvas context");
+
+      if (backgroundImg) {
+        bgCtx.drawImage(backgroundImg, 0, 0, INTERNAL_W, INTERNAL_H);
+      }
+      const imageBase64 = bgCanvas.toDataURL("image/png");
+
+      // Get the mask as base64 (white = erase, black = keep)
+      // We need to create a proper black background + white strokes mask
+      const maskCanvas2 = document.createElement("canvas");
+      maskCanvas2.width = INTERNAL_W;
+      maskCanvas2.height = INTERNAL_H;
+      const maskCtx2 = maskCanvas2.getContext("2d");
+      if (!maskCtx2) throw new Error("No mask context");
+      maskCtx2.fillStyle = "black";
+      maskCtx2.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+      maskCtx2.drawImage(mask, 0, 0);
+      const maskBase64 = maskCanvas2.toDataURL("image/png");
+
+      const resultBase64 = await onInpaintMask(imageBase64, maskBase64);
+
+      // Clear the mask after successful inpainting
+      clearMask();
+      setEraserMode("none");
+    } catch (err: any) {
+      setApplyError(err?.message || "Error al procesar la imagen");
+    } finally {
+      setIsApplying(false);
+    }
+  }, [hasMask, backgroundImage, backgroundImg, onInpaintMask, clearMask]);
 
   // ─── Hit test: which object is at canvas coords ───
   const hitTestObject = useCallback(
@@ -116,10 +212,8 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
   const hitTestObstacleAtPoint = useCallback(
     (clientX: number, clientY: number): string | null => {
       if (!overlayRef.current) return null;
-      // Use elementFromPoint to find which obstacle div is under the finger
       const el = document.elementFromPoint(clientX, clientY);
       if (!el) return null;
-      // Walk up the DOM to find an element with data-obstacle-id
       let node: Element | null = el;
       while (node && node !== overlayRef.current) {
         const id = node.getAttribute("data-obstacle-id");
@@ -140,7 +234,6 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
         next.add(id);
         return next;
       });
-      // After fade animation, actually delete
       setTimeout(() => {
         onObstacleDelete?.(id);
         setErasingIds((prev) => {
@@ -153,10 +246,16 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
     [onObstacleDelete]
   );
 
-  // ─── Mouse handlers for canvas (plant dragging) ───
+  // ─── Mouse handlers for canvas ───
   const handleMouseDown = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (eraserMode) return; // In eraser mode, canvas clicks are ignored
+      if (eraserMode === "paint") {
+        isPaintingRef.current = true;
+        setIsPainting(true);
+        paintMaskAt(e.clientX, e.clientY);
+        return;
+      }
+      if (eraserMode === "obstacle") return;
       const { x, y } = getCanvasCoords(e.clientX, e.clientY);
       const hit = hitTestObject(x, y);
       if (hit) {
@@ -169,12 +268,16 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
         onSelectionChange?.([]);
       }
     },
-    [eraserMode, getCanvasCoords, hitTestObject, onSelectionChange]
+    [eraserMode, getCanvasCoords, hitTestObject, onSelectionChange, paintMaskAt]
   );
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
-      if (!isDragging || !selectedObjectId || eraserMode) return;
+      if (eraserMode === "paint" && isPaintingRef.current) {
+        paintMaskAt(e.clientX, e.clientY);
+        return;
+      }
+      if (!isDragging || !selectedObjectId || eraserMode !== "none") return;
       const { x, y } = getCanvasCoords(e.clientX, e.clientY);
       const newX = Math.max(0, Math.min(INTERNAL_W, x - dragOffset.x));
       const newY = Math.max(0, Math.min(INTERNAL_H, y - dragOffset.y));
@@ -184,17 +287,27 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
       objectsRef.current = updated;
       onObjectsChange?.(updated);
     },
-    [isDragging, selectedObjectId, eraserMode, getCanvasCoords, dragOffset, onObjectsChange]
+    [isDragging, selectedObjectId, eraserMode, getCanvasCoords, dragOffset, onObjectsChange, paintMaskAt]
   );
 
   const handleMouseUp = useCallback(() => {
+    isPaintingRef.current = false;
+    setIsPainting(false);
     setIsDragging(false);
   }, []);
 
-  // ─── Touch handlers for canvas (plant dragging) ───
+  // ─── Touch handlers for canvas ───
   const handleTouchStart = useCallback(
     (e: React.TouchEvent<HTMLCanvasElement>) => {
-      if (eraserMode) return;
+      if (eraserMode === "paint") {
+        e.preventDefault();
+        isPaintingRef.current = true;
+        setIsPainting(true);
+        const touch = e.touches[0];
+        paintMaskAt(touch.clientX, touch.clientY);
+        return;
+      }
+      if (eraserMode === "obstacle") return;
       const touch = e.touches[0];
       const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
       const hit = hitTestObject(x, y);
@@ -205,12 +318,18 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
         onSelectionChange?.([hit]);
       }
     },
-    [eraserMode, getCanvasCoords, hitTestObject, onSelectionChange]
+    [eraserMode, getCanvasCoords, hitTestObject, onSelectionChange, paintMaskAt]
   );
 
   const handleTouchMove = useCallback(
     (e: React.TouchEvent<HTMLCanvasElement>) => {
-      if (!isDragging || !selectedObjectId || eraserMode) return;
+      if (eraserMode === "paint" && isPaintingRef.current) {
+        e.preventDefault();
+        const touch = e.touches[0];
+        paintMaskAt(touch.clientX, touch.clientY);
+        return;
+      }
+      if (!isDragging || !selectedObjectId || eraserMode !== "none") return;
       e.preventDefault();
       const touch = e.touches[0];
       const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
@@ -222,10 +341,12 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
       objectsRef.current = updated;
       onObjectsChange?.(updated);
     },
-    [isDragging, selectedObjectId, eraserMode, getCanvasCoords, dragOffset, onObjectsChange]
+    [isDragging, selectedObjectId, eraserMode, getCanvasCoords, dragOffset, onObjectsChange, paintMaskAt]
   );
 
   const handleTouchEnd = useCallback(() => {
+    isPaintingRef.current = false;
+    setIsPainting(false);
     setIsDragging(false);
   }, []);
 
@@ -259,10 +380,10 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
     [getCanvasCoords, onObjectsChange]
   );
 
-  // ─── ERASER: overlay touch/mouse handlers ───
+  // ─── OBSTACLE ERASER: overlay touch/mouse handlers ───
   const handleEraserPointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!eraserMode) return;
+      if (eraserMode !== "obstacle") return;
       eraserActiveRef.current = true;
       const id = hitTestObstacleAtPoint(e.clientX, e.clientY);
       if (id) eraseObstacle(id);
@@ -272,7 +393,7 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
 
   const handleEraserPointerMove = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
-      if (!eraserMode || !eraserActiveRef.current) return;
+      if (eraserMode !== "obstacle" || !eraserActiveRef.current) return;
       const id = hitTestObstacleAtPoint(e.clientX, e.clientY);
       if (id) eraseObstacle(id);
     },
@@ -368,20 +489,89 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
   return (
     <div ref={containerRef} className="w-full h-full min-h-[250px] relative select-none">
 
-      {/* ─── Eraser Mode Toggle Button ─── */}
-      {obstacles.length > 0 && (
-        <button
-          onClick={() => setEraserMode((v) => !v)}
-          className={`absolute top-2 right-2 z-40 flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold shadow-lg transition-all active:scale-95 ${
-            eraserMode
-              ? "bg-orange-500 text-white ring-2 ring-orange-300 ring-offset-1"
-              : "bg-white/90 text-gray-700 border border-gray-300 hover:bg-orange-50 hover:border-orange-400"
-          }`}
-          title={eraserMode ? "Modo borrador activo — arrastra sobre obstáculos para borrarlos" : "Activar modo borrador"}
-        >
-          <span className="text-base">🧹</span>
-          <span>{eraserMode ? "Borrando..." : "Borrador"}</span>
-        </button>
+      {/* ─── Toolbar ─── */}
+      <div className="absolute top-2 right-2 z-40 flex flex-col gap-1 items-end">
+        {/* Paint eraser button */}
+        {onInpaintMask && (
+          <button
+            onClick={() => {
+              setEraserMode((v) => v === "paint" ? "none" : "paint");
+              clearMask();
+            }}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold shadow-lg transition-all active:scale-95 ${
+              eraserMode === "paint"
+                ? "bg-blue-600 text-white ring-2 ring-blue-300 ring-offset-1"
+                : "bg-white/90 text-gray-700 border border-gray-300 hover:bg-blue-50 hover:border-blue-400"
+            }`}
+            title="Pintar zona a borrar con IA"
+          >
+            <span className="text-base">✏️</span>
+            <span>{eraserMode === "paint" ? "Pintando..." : "Borrar zona"}</span>
+          </button>
+        )}
+
+        {/* Obstacle eraser button */}
+        {obstacles.length > 0 && (
+          <button
+            onClick={() => setEraserMode((v) => v === "obstacle" ? "none" : "obstacle")}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold shadow-lg transition-all active:scale-95 ${
+              eraserMode === "obstacle"
+                ? "bg-orange-500 text-white ring-2 ring-orange-300 ring-offset-1"
+                : "bg-white/90 text-gray-700 border border-gray-300 hover:bg-orange-50 hover:border-orange-400"
+            }`}
+            title="Borrar marcadores de obstáculos"
+          >
+            <span className="text-base">🧹</span>
+            <span>{eraserMode === "obstacle" ? "Borrando..." : "Borrador"}</span>
+          </button>
+        )}
+      </div>
+
+      {/* ─── Paint mode controls ─── */}
+      {eraserMode === "paint" && (
+        <div className="absolute top-2 left-2 z-40 bg-white/95 rounded-xl shadow-lg p-2 flex flex-col gap-2 min-w-[160px]">
+          <div className="text-xs font-bold text-blue-700">✏️ Pinta la zona a borrar</div>
+
+          {/* Brush size */}
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] text-gray-500 w-12">Tamaño:</span>
+            <input
+              type="range"
+              min={10}
+              max={100}
+              value={brushSize}
+              onChange={(e) => setBrushSize(Number(e.target.value))}
+              className="flex-1 h-1.5 accent-blue-600"
+            />
+            <span className="text-[10px] text-gray-500 w-6">{brushSize}</span>
+          </div>
+
+          {/* Action buttons */}
+          <div className="flex gap-1">
+            <button
+              onClick={clearMask}
+              disabled={!hasMask}
+              className="flex-1 text-[10px] py-1 rounded-lg bg-gray-100 hover:bg-gray-200 disabled:opacity-40 font-medium"
+            >
+              Limpiar
+            </button>
+            <button
+              onClick={applyInpaint}
+              disabled={!hasMask || isApplying}
+              className="flex-1 text-[10px] py-1 rounded-lg bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-40 font-bold flex items-center justify-center gap-1"
+            >
+              {isApplying ? (
+                <><Loader2 className="w-2.5 h-2.5 animate-spin" /> Borrando...</>
+              ) : (
+                "✨ Borrar"
+              )}
+            </button>
+          </div>
+
+          {applyError && (
+            <p className="text-[10px] text-red-500">{applyError}</p>
+          )}
+        </div>
       )}
 
       {/* ─── Canvas: background + plants ─── */}
@@ -401,9 +591,44 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
         className="w-full h-auto rounded-lg shadow-inner block"
         style={{
           touchAction: "none",
-          cursor: eraserMode ? "none" : "crosshair",
+          cursor: eraserMode === "paint" ? "crosshair" : eraserMode === "obstacle" ? "none" : "crosshair",
         }}
       />
+
+      {/* ─── Mask canvas overlay (paint eraser) ─── */}
+      {eraserMode === "paint" && (
+        <canvas
+          ref={maskCanvasRef}
+          width={INTERNAL_W}
+          height={INTERNAL_H}
+          className="absolute top-0 left-0 w-full h-auto rounded-lg pointer-events-none"
+          style={{
+            opacity: 0.55,
+            mixBlendMode: "multiply",
+          }}
+        />
+      )}
+      {/* Always keep mask canvas in DOM but hidden when not painting */}
+      {eraserMode !== "paint" && (
+        <canvas
+          ref={maskCanvasRef}
+          width={INTERNAL_W}
+          height={INTERNAL_H}
+          className="absolute top-0 left-0 w-full h-auto rounded-lg pointer-events-none"
+          style={{ display: "none" }}
+        />
+      )}
+
+      {/* ─── Applying overlay ─── */}
+      {isApplying && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 rounded-lg">
+          <div className="bg-white rounded-xl p-4 flex flex-col items-center gap-2 shadow-xl">
+            <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
+            <p className="text-sm font-bold text-gray-800">Borrando zona...</p>
+            <p className="text-xs text-gray-400">IA procesando la imagen</p>
+          </div>
+        </div>
+      )}
 
       {/* ─── Obstacle Overlay ─── */}
       {obstacles.length > 0 && (
@@ -412,10 +637,8 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
           className="absolute top-0 left-0 w-full rounded-lg overflow-hidden"
           style={{
             aspectRatio: `${INTERNAL_W} / ${INTERNAL_H}`,
-            pointerEvents: eraserMode ? "auto" : "none",
-            cursor: eraserMode ? "crosshair" : "default",
-            // Show eraser cursor when in eraser mode
-            ...(eraserMode && { cursor: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32' viewBox='0 0 32 32'%3E%3Crect x='4' y='16' width='24' height='12' rx='2' fill='%23ff6b35' stroke='%23333' stroke-width='1.5'/%3E%3Crect x='4' y='4' width='24' height='12' rx='2' fill='%23ffd166' stroke='%23333' stroke-width='1.5'/%3E%3Cline x1='4' y1='16' x2='28' y2='16' stroke='%23333' stroke-width='1'/%3E%3C/svg%3E\") 16 28, crosshair" }),
+            pointerEvents: eraserMode === "obstacle" ? "auto" : "none",
+            cursor: eraserMode === "obstacle" ? "crosshair" : "default",
           }}
           onPointerDown={handleEraserPointerDown}
           onPointerMove={handleEraserPointerMove}
@@ -431,7 +654,7 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
                 className={`absolute border-2 border-dashed transition-all ${
                   isErasing
                     ? "border-orange-400 bg-orange-400/60 scale-110 opacity-0"
-                    : eraserMode
+                    : eraserMode === "obstacle"
                     ? "border-orange-400 bg-orange-400/25 hover:bg-orange-400/50 hover:border-orange-500"
                     : "border-red-500 bg-red-500/20"
                 }`}
@@ -440,16 +663,15 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
                   top: `${topPct}%`,
                   width: `${widthPct}%`,
                   height: `${heightPct}%`,
-                  pointerEvents: eraserMode ? "auto" : "none",
+                  pointerEvents: eraserMode === "obstacle" ? "auto" : "none",
                   transition: isErasing ? "all 0.2s ease-out" : "border-color 0.15s, background-color 0.15s",
                   zIndex: 10,
                 }}
                 title={`${obs.label} (${(obs.confidence * 100).toFixed(0)}%)`}
               >
-                {/* Label tag */}
                 <span
                   className={`absolute -top-5 left-1/2 -translate-x-1/2 text-[9px] sm:text-[10px] font-bold whitespace-nowrap px-1 py-0.5 rounded shadow pointer-events-none ${
-                    eraserMode ? "bg-orange-500 text-white" : "bg-red-600 text-white"
+                    eraserMode === "obstacle" ? "bg-orange-500 text-white" : "bg-red-600 text-white"
                   }`}
                 >
                   {obs.label}
@@ -461,19 +683,21 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
       )}
 
       {/* ─── Hint bar ─── */}
-      {obstacles.length > 0 && (
-        <div className="absolute bottom-2 left-1/2 -translate-x-1/2 pointer-events-none z-20">
-          {eraserMode ? (
-            <div className="bg-orange-500/90 text-white text-[10px] sm:text-xs px-3 py-1.5 rounded-full font-semibold shadow-lg flex items-center gap-1.5 animate-pulse">
-              🧹 Arrastra el dedo sobre los obstáculos para borrarlos
-            </div>
-          ) : (
-            <div className="bg-black/60 text-white text-[10px] sm:text-xs px-3 py-1 rounded-full">
-              Toca 🧹 Borrador para eliminar obstáculos con el dedo
-            </div>
-          )}
-        </div>
-      )}
+      <div className="absolute bottom-2 left-1/2 -translate-x-1/2 pointer-events-none z-20">
+        {eraserMode === "paint" ? (
+          <div className="bg-blue-600/90 text-white text-[10px] sm:text-xs px-3 py-1.5 rounded-full font-semibold shadow-lg flex items-center gap-1.5">
+            ✏️ Pinta la zona a borrar · luego toca <strong>Borrar</strong>
+          </div>
+        ) : eraserMode === "obstacle" ? (
+          <div className="bg-orange-500/90 text-white text-[10px] sm:text-xs px-3 py-1.5 rounded-full font-semibold shadow-lg flex items-center gap-1.5 animate-pulse">
+            🧹 Arrastra el dedo sobre los obstáculos para borrarlos
+          </div>
+        ) : obstacles.length > 0 ? (
+          <div className="bg-black/60 text-white text-[10px] sm:text-xs px-3 py-1 rounded-full">
+            Toca 🧹 Borrador para eliminar obstáculos · ✏️ Borrar zona para editar la foto
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 };

@@ -286,6 +286,24 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
     [detectedObstacles, backgroundImage, projectId, inpaintMutation]
   );
 
+  // ─── AI Inpainting: freehand mask (from canvas paint eraser) ───
+  const handleInpaintMask = useCallback(
+    async (imageBase64: string, maskBase64: string): Promise<string> => {
+      const result = await inpaintMutation.mutateAsync({
+        imageBase64,
+        maskBase64,
+        obstacles: [],
+      });
+      const cleanedImage = result.imageBase64;
+      setBackgroundImage(cleanedImage);
+      try {
+        localStorage.setItem(`captureImage_${projectId}`, cleanedImage);
+      } catch {}
+      return cleanedImage;
+    },
+    [projectId, inpaintMutation]
+  );
+
   // ─── AI Inpainting: erase ALL obstacles from the photo ───
   const handleInpaintAll = useCallback(async () => {
     if (detectedObstacles.length === 0 || !backgroundImage) return;
@@ -711,6 +729,7 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
           if (selected.length > 0) liveInteraction.selectObject(selected[0]);
         }}
         onObstacleDelete={handleObstacleRemove}
+        onInpaintMask={handleInpaintMask}
       />
     </div>
   );
