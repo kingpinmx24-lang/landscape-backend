@@ -1,29 +1,16 @@
-import React, { useState, useMemo } from "react";
+import React, { useState, useEffect } from "react";
 import { useRoute, useLocation } from "wouter";
 import { Button } from "../components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "../components/ui/card";
 import { Alert, AlertDescription } from "../components/ui/alert";
 import { ArrowLeft, Loader2 } from "lucide-react";
-
-/**
- * Resolve the capture image from all possible storage locations.
- */
-function resolveCaptureImage(projectId: string, project: any): string | undefined {
-  // 1. Separate key (primary)
-  const separate = localStorage.getItem(`captureImage_${projectId}`);
-  if (separate && separate.startsWith("data:")) return separate;
-
-  // 2. Inline in project (if it's a real data URL)
-  if (project.captureImage && typeof project.captureImage === "string" && project.captureImage.startsWith("data:")) {
-    return project.captureImage;
-  }
-
-  // 3. Legacy capture object
-  if (project.capture?.imageUrl?.startsWith("data:")) return project.capture.imageUrl;
-  if (project.capture?.imageBase64?.startsWith("data:")) return project.capture.imageBase64;
-
-  return undefined;
-}
+import { loadImage } from "../lib/imageStorage";
 
 export default function Design() {
   const [, params] = useRoute("/projects/:id/design");
@@ -32,15 +19,41 @@ export default function Design() {
 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [captureImage, setCaptureImage] = useState<string | null>(null);
+  const [imageLoading, setImageLoading] = useState(true);
 
   const project = projectId
-    ? JSON.parse(localStorage.getItem(`project_${projectId}`) || "{}")
+    ? JSON.parse(
+        localStorage.getItem(`project_${projectId}`) ||
+          sessionStorage.getItem(`project_${projectId}`) ||
+          "{}"
+      )
     : null;
 
-  const captureImage = useMemo(
-    () => (projectId && project?.id ? resolveCaptureImage(projectId, project) : undefined),
-    [projectId, project?.id]
-  );
+  // Load image from IndexedDB (or localStorage fallback) asynchronously
+  useEffect(() => {
+    if (!projectId) return;
+    setImageLoading(true);
+    loadImage(`captureImage_${projectId}`)
+      .then((img) => {
+        if (img) {
+          setCaptureImage(img);
+        } else {
+          // Last resort: check if it's inline in the project object
+          if (
+            project?.captureImage &&
+            typeof project.captureImage === "string" &&
+            project.captureImage.startsWith("data:")
+          ) {
+            setCaptureImage(project.captureImage);
+          }
+        }
+      })
+      .catch((err) => {
+        console.error("[Design] Failed to load image:", err);
+      })
+      .finally(() => setImageLoading(false));
+  }, [projectId]);
 
   if (!project || !project.id) {
     return (
@@ -60,6 +73,18 @@ export default function Design() {
     );
   }
 
+  // Show spinner while loading image from IndexedDB
+  if (imageLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <Loader2 className="w-10 h-10 animate-spin mx-auto text-blue-600" />
+          <p className="text-gray-600">Cargando foto...</p>
+        </div>
+      </div>
+    );
+  }
+
   if (!captureImage) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -69,7 +94,9 @@ export default function Design() {
           </CardHeader>
           <CardContent>
             <p className="text-gray-600 mb-4">Debes capturar una foto primero.</p>
-            <Button onClick={() => setLocation(`/projects/${projectId}/capture`)}>
+            <Button
+              onClick={() => setLocation(`/projects/${projectId}/capture`)}
+            >
               Volver a capturar
             </Button>
           </CardContent>
@@ -85,26 +112,26 @@ export default function Design() {
 
       const updatedProject = {
         ...project,
+        captureImage: "__stored_separately__",
         status: "designed",
         updatedAt: new Date().toISOString(),
       };
 
-      // Don't include captureImage in project metadata to keep it small
-      delete updatedProject.captureImage;
-      updatedProject.captureImage = "__stored_separately__";
-
       try {
-        localStorage.setItem(`project_${projectId}`, JSON.stringify(updatedProject));
-      } catch (storageErr) {
-        sessionStorage.setItem(`project_${projectId}`, JSON.stringify(updatedProject));
+        localStorage.setItem(
+          `project_${projectId}`,
+          JSON.stringify(updatedProject)
+        );
+      } catch {
+        sessionStorage.setItem(
+          `project_${projectId}`,
+          JSON.stringify(updatedProject)
+        );
       }
 
-      setTimeout(() => {
-        setLocation(`/projects/${projectId}/adjust`);
-      }, 500);
+      setLocation(`/projects/${projectId}/adjust`);
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Error al continuar";
-      setError(message);
+      setError(err instanceof Error ? err.message : "Error al continuar");
     } finally {
       setIsLoading(false);
     }
@@ -123,7 +150,9 @@ export default function Design() {
             <ArrowLeft className="w-4 h-4" />
           </Button>
           <div>
-            <h1 className="text-xl md:text-2xl font-bold text-gray-900">Paso 3: Diseño</h1>
+            <h1 className="text-xl md:text-2xl font-bold text-gray-900">
+              Paso 3: Diseño
+            </h1>
             <p className="text-xs md:text-sm text-gray-600">
               Proyecto: {project.name}
             </p>
@@ -137,9 +166,7 @@ export default function Design() {
           <Card>
             <CardHeader>
               <CardTitle>Foto Capturada</CardTitle>
-              <CardDescription>
-                Imagen del terreno
-              </CardDescription>
+              <CardDescription>Imagen del terreno</CardDescription>
             </CardHeader>
             <CardContent>
               <img
@@ -154,9 +181,7 @@ export default function Design() {
           <Card>
             <CardHeader>
               <CardTitle>Análisis del Terreno</CardTitle>
-              <CardDescription>
-                Información detectada
-              </CardDescription>
+              <CardDescription>Información detectada</CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
               {error && (
@@ -177,13 +202,16 @@ export default function Design() {
                 </div>
 
                 <div className="bg-gray-50 p-4 rounded-lg">
-                  <h3 className="font-semibold text-gray-900 mb-2">Dirección</h3>
+                  <h3 className="font-semibold text-gray-900 mb-2">
+                    Dirección
+                  </h3>
                   <p className="text-sm text-gray-600">{project.address}</p>
                 </div>
 
                 <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                   <p className="text-sm text-blue-900">
-                    El análisis automático de zonas se ejecutará en el siguiente paso.
+                    El análisis automático de zonas se ejecutará en el siguiente
+                    paso.
                   </p>
                 </div>
 

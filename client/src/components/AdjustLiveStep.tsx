@@ -44,6 +44,7 @@ import { DesignData, AdjustLiveData } from "@shared/workflow-persistence-types";
 import { AIDesignAssistant } from "./AIDesignAssistant";
 import { Obstacle } from "./ObstacleDetector";
 import { trpc } from "@/lib/trpc";
+import { saveImage } from "@/lib/imageStorage";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -288,10 +289,8 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
         const cleanedImage = result.imageBase64;
         // Update the background image with the cleaned version
         setBackgroundImage(cleanedImage);
-        // Save to localStorage so it persists
-        try {
-          localStorage.setItem(`captureImage_${projectId}`, cleanedImage);
-        } catch {}
+        // Save to IndexedDB (no size limit on iOS Safari)
+        saveImage(`captureImage_${projectId}`, cleanedImage).catch(() => {});
         // Remove the obstacle marker
         setDetectedObstacles((prev) => prev.filter((o) => o.id !== obstacleId));
       } catch (err: any) {
@@ -315,9 +314,8 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
       });
       const cleanedImage = result.imageBase64;
       setBackgroundImage(cleanedImage);
-      try {
-        localStorage.setItem(`captureImage_${projectId}`, cleanedImage);
-      } catch {}
+      // Save to IndexedDB (no size limit on iOS Safari)
+      saveImage(`captureImage_${projectId}`, cleanedImage).catch(() => {});
       return cleanedImage;
     },
     [projectId, inpaintMutation]
@@ -340,9 +338,8 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
       });
       const cleanedImage = result.imageBase64;
       setBackgroundImage(cleanedImage);
-      try {
-        localStorage.setItem(`captureImage_${projectId}`, cleanedImage);
-      } catch {}
+      // Save to IndexedDB (no size limit on iOS Safari)
+      saveImage(`captureImage_${projectId}`, cleanedImage).catch(() => {});
       setDetectedObstacles([]);
     } catch (err: any) {
       setInpaintError(err.message || "Error al limpiar el terreno");

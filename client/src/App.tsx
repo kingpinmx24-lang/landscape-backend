@@ -16,6 +16,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "./components/ui/card";
 import { Button } from "./components/ui/button";
 import { useLocation } from "wouter";
 import { DesignData } from "@shared/workflow-persistence-types";
+import { loadImage } from "./lib/imageStorage";
+import { Loader2 } from "lucide-react";
 
 const DEFAULT_DESIGN: DesignData = {
   plants: [],
@@ -37,37 +39,37 @@ const DEFAULT_DESIGN: DesignData = {
 };
 
 /**
- * Utility: resolve the capture image from all possible storage locations.
- * Priority:
- *   1. Separate key `captureImage_${id}` (most reliable, avoids quota issues)
- *   2. `project.captureImage` if it's a real data URL (not the placeholder)
- *   3. `project.capture.imageUrl` or `project.capture.imageBase64` (legacy)
+ * Hook: load capture image from IndexedDB (primary) or localStorage (fallback).
+ * Returns [imageUrl, isLoading].
  */
-function resolveCaptureImage(projectId: string, project: any): string | undefined {
-  // 1. Separate key
-  const separate = localStorage.getItem(`captureImage_${projectId}`);
-  if (separate && separate.startsWith("data:")) {
-    return separate;
-  }
+function useCaptureImage(projectId: string, project: any): [string | undefined, boolean] {
+  const [captureImage, setCaptureImage] = React.useState<string | undefined>(undefined);
+  const [loading, setLoading] = React.useState(true);
 
-  // 2. Inline in project (if not the placeholder marker)
-  if (
-    project.captureImage &&
-    typeof project.captureImage === "string" &&
-    project.captureImage.startsWith("data:")
-  ) {
-    return project.captureImage;
-  }
+  React.useEffect(() => {
+    if (!projectId) { setLoading(false); return; }
+    setLoading(true);
+    loadImage(`captureImage_${projectId}`)
+      .then((img) => {
+        if (img) {
+          setCaptureImage(img);
+        } else if (
+          project?.captureImage &&
+          typeof project.captureImage === "string" &&
+          project.captureImage.startsWith("data:")
+        ) {
+          setCaptureImage(project.captureImage);
+        } else if (project?.capture?.imageUrl?.startsWith("data:")) {
+          setCaptureImage(project.capture.imageUrl);
+        } else if (project?.capture?.imageBase64?.startsWith("data:")) {
+          setCaptureImage(project.capture.imageBase64);
+        }
+      })
+      .catch((err) => console.error("[useCaptureImage] failed:", err))
+      .finally(() => setLoading(false));
+  }, [projectId]);
 
-  // 3. Legacy capture object
-  if (project.capture?.imageUrl && project.capture.imageUrl.startsWith("data:")) {
-    return project.capture.imageUrl;
-  }
-  if (project.capture?.imageBase64 && project.capture.imageBase64.startsWith("data:")) {
-    return project.capture.imageBase64;
-  }
-
-  return undefined;
+  return [captureImage, loading];
 }
 
 function AdjustLivePageRoute() {
@@ -97,8 +99,36 @@ function AdjustLivePageRoute() {
     );
   }
 
-  const captureImage = resolveCaptureImage(projectId, project);
-  console.log("[AdjustLivePageRoute] captureImage resolved:", captureImage ? `${captureImage.length} chars` : "NONE");
+  const [captureImage, imageLoading] = useCaptureImage(projectId, project);
+
+  if (imageLoading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="text-center space-y-4">
+          <Loader2 className="w-10 h-10 animate-spin mx-auto text-blue-600" />
+          <p className="text-gray-600">Cargando foto del terreno...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!captureImage) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <Card className="max-w-md">
+          <CardHeader>
+            <CardTitle>Foto no encontrada</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-gray-600 mb-4">No se pudo cargar la foto del terreno.</p>
+            <Button onClick={() => setLocation(`/projects/${projectId}/capture`)} className="w-full">
+              Volver a capturar
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <AdjustLiveStep
