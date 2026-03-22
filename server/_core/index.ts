@@ -33,7 +33,7 @@ async function startServer() {
   const app = express();
   const server = createServer(app);
 
-  // Enable CORS for frontend connection (Vercel)
+  // Enable CORS for frontend connection
   app.use(cors({
     origin: true,
     credentials: true,
@@ -43,19 +43,10 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  // Health check endpoints - both / and /health return 200 OK
-  // Render uses / by default for health checks
-  app.get("/", (_req, res) => {
-    res.json({ status: "ok", service: "landscape-backend", timestamp: new Date().toISOString() });
-  });
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", timestamp: new Date().toISOString() });
-  });
-
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);
 
-  // AI Inpainting API (DALL-E 2 obstacle removal)
+  // AI Inpainting endpoint
   app.use("/api/inpaint", inpaintRouter);
 
   // tRPC API
@@ -67,26 +58,20 @@ async function startServer() {
     })
   );
 
-  // Development mode uses Vite for local development
+  // development mode uses Vite for local development
   if (process.env.NODE_ENV === "development") {
     await setupVite(app, server);
   }
-  // Production mode: Backend only exposes API. Frontend is deployed separately on Vercel.
+  // Production mode: Backend only exposes API. Frontend is deployed separately (e.g., Vercel).
 
-  // In production (Render), use PORT directly without scanning.
-  // In development, scan for an available port to avoid conflicts.
   const preferredPort = parseInt(process.env.PORT || "3000");
-  const port = process.env.NODE_ENV === "production"
-    ? preferredPort
-    : await findAvailablePort(preferredPort);
-
-  if (process.env.NODE_ENV !== "production" && port !== preferredPort) {
+  const port = await findAvailablePort(preferredPort);
+  if (port !== preferredPort) {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
 
-  // Bind to 0.0.0.0 so Render's proxy can reach the server
-  server.listen(port, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${port}/`);
+  server.listen(port, () => {
+    console.log(`Server running on http://localhost:${port}/`);
   });
 }
 
