@@ -1,3 +1,4 @@
+import React, { useState, useEffect } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/NotFound";
 import { Route, Switch, useRoute } from "wouter";
@@ -43,10 +44,10 @@ const DEFAULT_DESIGN: DesignData = {
  * Returns [imageUrl, isLoading].
  */
 function useCaptureImage(projectId: string, project: any): [string | undefined, boolean] {
-  const [captureImage, setCaptureImage] = React.useState<string | undefined>(undefined);
-  const [loading, setLoading] = React.useState(true);
+  const [captureImage, setCaptureImage] = useState<string | undefined>(undefined);
+  const [loading, setLoading] = useState(true);
 
-  React.useEffect(() => {
+  useEffect(() => {
     if (!projectId) { setLoading(false); return; }
     setLoading(true);
     loadImage(`captureImage_${projectId}`)
