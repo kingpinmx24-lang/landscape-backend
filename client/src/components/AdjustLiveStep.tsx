@@ -43,6 +43,7 @@ import { useInventory } from "@/hooks/useInventory";
 import { DesignData, AdjustLiveData } from "@shared/workflow-persistence-types";
 import { AIDesignAssistant } from "./AIDesignAssistant";
 import { ObstacleDetector, Obstacle, runObstacleDetection } from "./ObstacleDetector";
+import { trpc } from "@/lib/trpc";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -106,41 +107,8 @@ function resolveCaptureImage(
   return "";
 }
 
-// ─── Inpainting API call ─────────────────────────────────────────────────────
-
-async function callInpaintAPI(
-  imageBase64: string,
-  obstacles: Obstacle[]
-): Promise<string> {
-  const payload = {
-    imageBase64,
-    obstacles: obstacles.map((o) => ({
-      x: o.x,
-      y: o.y,
-      width: o.width,
-      height: o.height,
-      label: o.label,
-    })),
-  };
-
-  const backendUrl =
-    (import.meta as any).env?.VITE_BACKEND_URL ||
-    "https://landscape-backend.onrender.com";
-
-  const response = await fetch(`${backendUrl}/api/inpaint`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const err = await response.json().catch(() => ({ error: "Unknown error" }));
-    throw new Error(err.error || `HTTP ${response.status}`);
-  }
-
-  const data = await response.json();
-  return data.imageBase64 as string;
-}
+// ─── Inpainting API call (via tRPC) ─────────────────────────────────────────
+// callInpaintAPI is now defined inside the component using trpc.inpaint.cleanTerrain
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 
@@ -179,6 +147,9 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
 
   // ─── Canvas drop zone ref ───
   const canvasContainerRef = useRef<HTMLDivElement>(null);
+
+  // ─── tRPC inpainting mutation ───
+  const inpaintMutation = trpc.inpaint.cleanTerrain.useMutation();
 
   const liveInteraction = useLiveInteraction();
   const designSync = useDesignSync(projectId, {
@@ -289,7 +260,13 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
       setInpaintError(null);
 
       try {
-        const cleanedImage = await callInpaintAPI(backgroundImage, [obstacle]);
+        const result = await inpaintMutation.mutateAsync({
+          imageBase64: backgroundImage,
+          obstacles: [obstacle].map((o) => ({
+            x: o.x, y: o.y, width: o.width, height: o.height, label: o.label,
+          })),
+        });
+        const cleanedImage = result.imageBase64;
         // Update the background image with the cleaned version
         setBackgroundImage(cleanedImage);
         // Save to localStorage so it persists
@@ -306,7 +283,7 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
         setInpaintingObstacleId(null);
       }
     },
-    [detectedObstacles, backgroundImage, projectId]
+    [detectedObstacles, backgroundImage, projectId, inpaintMutation]
   );
 
   // ─── AI Inpainting: erase ALL obstacles from the photo ───
@@ -317,10 +294,13 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
     setInpaintError(null);
 
     try {
-      const cleanedImage = await callInpaintAPI(
-        backgroundImage,
-        detectedObstacles
-      );
+      const result = await inpaintMutation.mutateAsync({
+        imageBase64: backgroundImage,
+        obstacles: detectedObstacles.map((o) => ({
+          x: o.x, y: o.y, width: o.width, height: o.height, label: o.label,
+        })),
+      });
+      const cleanedImage = result.imageBase64;
       setBackgroundImage(cleanedImage);
       try {
         localStorage.setItem(`captureImage_${projectId}`, cleanedImage);

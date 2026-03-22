@@ -5,6 +5,7 @@ import { publicProcedure, router } from "./_core/trpc";
 import { projectsRouter } from "./routers/projects";
 import { capturesRouter } from "./routers/captures";
 import { inventoryRouter } from "./routers/inventory";
+import { inpaintRouter } from "./routers/inpaint";
 
 export const appRouter = router({
     // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
@@ -23,6 +24,7 @@ export const appRouter = router({
   projects: projectsRouter,
   captures: capturesRouter,
   inventory: inventoryRouter,
+  inpaint: inpaintRouter,
 });
 
 export type AppRouter = typeof appRouter;

@@ -1,23 +1,19 @@
 /**
- * Inpainting API
+ * Inpainting tRPC Router
  * ============================================================================
- * Receives a base64 image + obstacle bounding box, creates a mask,
+ * Receives a base64 image + obstacle bounding boxes, creates a mask,
  * calls OpenAI DALL-E 2 edit endpoint, returns the cleaned image.
  *
- * POST /api/inpaint
- * Body: { imageBase64: string, obstacles: Array<{x,y,width,height,label}> }
- * Returns: { imageBase64: string }
+ * Called via: trpc.inpaint.cleanTerrain.mutate({ imageBase64, obstacles })
  *
  * Uses pngjs (pure JavaScript, no native dependencies) for mask generation.
- * This avoids the node-canvas native compilation issues on Render.
  */
-import express from "express";
 import OpenAI from "openai";
 import { toFile } from "openai/uploads";
 import { Readable } from "stream";
 import { PNG } from "pngjs";
-
-const router = express.Router();
+import { z } from "zod";
+import { publicProcedure, router } from "../_core/trpc";
 
 // Initialize OpenAI client using the environment variable
 const openai = new OpenAI({
@@ -25,13 +21,13 @@ const openai = new OpenAI({
   baseURL: process.env.OPENAI_BASE_URL || undefined,
 });
 
-interface ObstacleBox {
-  x: number;       // center x (0-800 internal coords)
-  y: number;       // center y (0-600 internal coords)
-  width: number;   // width in internal coords
-  height: number;  // height in internal coords
-  label: string;
-}
+const ObstacleSchema = z.object({
+  x: z.number(),       // center x (0-800 internal coords)
+  y: z.number(),       // center y (0-600 internal coords)
+  width: z.number(),   // width in internal coords
+  height: z.number(),  // height in internal coords
+  label: z.string(),
+});
 
 /**
  * Convert base64 data URL to Buffer
@@ -48,7 +44,7 @@ function base64ToBuffer(base64: string): Buffer {
 function createMask(
   imageWidth: number,
   imageHeight: number,
-  obstacles: ObstacleBox[]
+  obstacles: z.infer<typeof ObstacleSchema>[]
 ): Buffer {
   const png = new PNG({ width: imageWidth, height: imageHeight, filterType: -1 });
 
@@ -56,10 +52,10 @@ function createMask(
   for (let y = 0; y < imageHeight; y++) {
     for (let x = 0; x < imageWidth; x++) {
       const idx = (imageWidth * y + x) << 2;
-      png.data[idx] = 0;       // R
-      png.data[idx + 1] = 0;   // G
-      png.data[idx + 2] = 0;   // B
-      png.data[idx + 3] = 255; // A = fully opaque (keep)
+      png.data[idx] = 0;
+      png.data[idx + 1] = 0;
+      png.data[idx + 2] = 0;
+      png.data[idx + 3] = 255; // fully opaque = keep
     }
   }
 
@@ -73,8 +69,6 @@ function createMask(
     const cy = obs.y * scaleY;
     const hw = (obs.width * scaleX) / 2;
     const hh = (obs.height * scaleY) / 2;
-
-    // Add 15% padding for full coverage
     const padX = hw * 0.15;
     const padY = hh * 0.15;
 
@@ -86,10 +80,10 @@ function createMask(
     for (let py = y1; py < y2; py++) {
       for (let px = x1; px < x2; px++) {
         const idx = (imageWidth * py + px) << 2;
-        png.data[idx] = 0;     // R
-        png.data[idx + 1] = 0; // G
-        png.data[idx + 2] = 0; // B
-        png.data[idx + 3] = 0; // A = fully transparent (inpaint here)
+        png.data[idx] = 0;
+        png.data[idx + 1] = 0;
+        png.data[idx + 2] = 0;
+        png.data[idx + 3] = 0; // fully transparent = inpaint here
       }
     }
   }
@@ -101,10 +95,7 @@ function createMask(
  * Resize a PNG buffer to targetSize x targetSize using nearest-neighbor sampling.
  * DALL-E 2 requires square images: 256x256, 512x512, or 1024x1024.
  */
-function resizePng(
-  inputBuffer: Buffer,
-  targetSize: number
-): Buffer {
+function resizePng(inputBuffer: Buffer, targetSize: number): Buffer {
   const src = PNG.sync.read(inputBuffer);
   const dst = new PNG({ width: targetSize, height: targetSize, filterType: -1 });
 
@@ -124,71 +115,66 @@ function resizePng(
   return PNG.sync.write(dst);
 }
 
-/**
- * Buffer to OpenAI File
- */
-async function bufferToFile(buffer: Buffer, filename: string): Promise<ReturnType<typeof toFile>> {
-  const stream = Readable.from(buffer);
-  return toFile(stream, filename, { type: "image/png" });
-}
+export const inpaintRouter = router({
+  cleanTerrain: publicProcedure
+    .input(
+      z.object({
+        imageBase64: z.string(),
+        obstacles: z.array(ObstacleSchema),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const { imageBase64, obstacles } = input;
 
-router.post("/", async (req, res) => {
-  try {
-    const { imageBase64, obstacles } = req.body as {
-      imageBase64: string;
-      obstacles: ObstacleBox[];
-    };
+      if (!obstacles.length) {
+        // Nothing to inpaint, return original
+        return { imageBase64 };
+      }
 
-    if (!imageBase64 || !obstacles || obstacles.length === 0) {
-      res.status(400).json({ error: "imageBase64 and obstacles are required" });
-      return;
-    }
+      console.log(`[Inpaint] Processing ${obstacles.length} obstacles...`);
 
-    console.log(`[Inpaint] Processing ${obstacles.length} obstacles...`);
+      // Parse original image to get dimensions
+      const origBuffer = base64ToBuffer(imageBase64);
+      const origPng = PNG.sync.read(origBuffer);
+      const { width: origW, height: origH } = origPng;
 
-    // 1. Parse original image to get dimensions
-    const origBuffer = base64ToBuffer(imageBase64);
-    const origPng = PNG.sync.read(origBuffer);
-    const { width: origW, height: origH } = origPng;
+      // Create mask at original dimensions
+      const maskBuffer = createMask(origW, origH, obstacles);
 
-    // 2. Create mask at original dimensions
-    const maskBuffer = createMask(origW, origH, obstacles);
+      // Resize both image and mask to 1024x1024 (DALL-E 2 requirement)
+      const imageBuffer1024 = resizePng(origBuffer, 1024);
+      const maskBuffer1024 = resizePng(maskBuffer, 1024);
 
-    // 3. Resize both image and mask to 1024x1024 (DALL-E 2 requirement)
-    const imageBuffer1024 = resizePng(origBuffer, 1024);
-    const maskBuffer1024 = resizePng(maskBuffer, 1024);
+      // Convert to OpenAI File objects
+      const imageFile = await toFile(
+        Readable.from(imageBuffer1024),
+        "image.png",
+        { type: "image/png" }
+      );
+      const maskFile = await toFile(
+        Readable.from(maskBuffer1024),
+        "mask.png",
+        { type: "image/png" }
+      );
 
-    // 4. Call OpenAI DALL-E 2 edit
-    const imageFile = await bufferToFile(imageBuffer1024, "image.png");
-    const maskFile = await bufferToFile(maskBuffer1024, "mask.png");
+      const obstacleLabels = obstacles.map((o) => o.label).join(", ");
 
-    const obstacleLabels = obstacles.map((o) => o.label).join(", ");
+      const response = await openai.images.edit({
+        model: "dall-e-2",
+        image: imageFile,
+        mask: maskFile,
+        prompt: `Clean empty outdoor garden/yard terrain. Remove ${obstacleLabels}. Replace with natural ground: gravel, dirt, or grass matching the surrounding area. Keep walls, fences, and background unchanged. Photorealistic.`,
+        n: 1,
+        size: "1024x1024",
+        response_format: "b64_json",
+      });
 
-    const response = await openai.images.edit({
-      model: "dall-e-2",
-      image: imageFile,
-      mask: maskFile,
-      prompt: `Clean empty outdoor garden/yard terrain. Remove ${obstacleLabels}. Replace with natural ground: gravel, dirt, or grass matching the surrounding area. Keep walls, fences, and background unchanged. Photorealistic.`,
-      n: 1,
-      size: "1024x1024",
-      response_format: "b64_json",
-    });
+      const resultBase64 = response.data?.[0]?.b64_json;
+      if (!resultBase64) {
+        throw new Error("No image returned from OpenAI");
+      }
 
-    const resultBase64 = response.data?.[0]?.b64_json;
-    if (!resultBase64) {
-      throw new Error("No image returned from OpenAI");
-    }
-
-    console.log(`[Inpaint] Success! Returning cleaned image.`);
-
-    res.json({
-      imageBase64: `data:image/png;base64,${resultBase64}`,
-    });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    console.error("[Inpaint] Error:", msg);
-    res.status(500).json({ error: msg });
-  }
+      console.log(`[Inpaint] Success!`);
+      return { imageBase64: `data:image/png;base64,${resultBase64}` };
+    }),
 });
-
-export default router;

@@ -8,7 +8,6 @@ import { registerOAuthRoutes } from "./oauth";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
-import inpaintRouter from "../routers/inpaint";
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -46,10 +45,7 @@ async function startServer() {
   // OAuth callback under /api/oauth/callback
   registerOAuthRoutes(app);
 
-  // AI Inpainting endpoint
-  app.use("/api/inpaint", inpaintRouter);
-
-  // tRPC API
+  // tRPC API (includes inpaint.cleanTerrain mutation)
   app.use(
     "/api/trpc",
     createExpressMiddleware({
