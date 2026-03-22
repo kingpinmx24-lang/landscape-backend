@@ -26,7 +26,7 @@ export interface Obstacle {
   y: number;
   width: number;
   height: number;
-  type: "structure" | "vegetation" | "debris" | "furniture" | "unknown";
+  type: "structure" | "vegetation" | "debris" | "furniture" | "unknown" | "obstacle";
   confidence: number;
   label: string;
 }

@@ -595,29 +595,18 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
         }}
       />
 
-      {/* ─── Mask canvas overlay (paint eraser) ─── */}
-      {eraserMode === "paint" && (
-        <canvas
-          ref={maskCanvasRef}
-          width={INTERNAL_W}
-          height={INTERNAL_H}
-          className="absolute top-0 left-0 w-full h-auto rounded-lg pointer-events-none"
-          style={{
-            opacity: 0.55,
-            mixBlendMode: "multiply",
-          }}
-        />
-      )}
-      {/* Always keep mask canvas in DOM but hidden when not painting */}
-      {eraserMode !== "paint" && (
-        <canvas
-          ref={maskCanvasRef}
-          width={INTERNAL_W}
-          height={INTERNAL_H}
-          className="absolute top-0 left-0 w-full h-auto rounded-lg pointer-events-none"
-          style={{ display: "none" }}
-        />
-      )}
+      {/* ─── Mask canvas overlay (always in DOM, visibility toggled) ─── */}
+      <canvas
+        ref={maskCanvasRef}
+        width={INTERNAL_W}
+        height={INTERNAL_H}
+        className="absolute top-0 left-0 w-full h-auto rounded-lg pointer-events-none"
+        style={{
+          opacity: eraserMode === "paint" ? 0.55 : 0,
+          mixBlendMode: "multiply",
+          display: "block",
+        }}
+      />
 
       {/* ─── Applying overlay ─── */}
       {isApplying && (

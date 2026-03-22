@@ -1,13 +1,15 @@
 /**
  * Inpainting tRPC Router
  * ============================================================================
- * Two modes:
- * 1. FREEHAND MASK: receives imageBase64 + maskBase64 (user-painted mask)
- *    → sends directly to Cloudflare AI inpainting
- * 2. OBSTACLE LIST: receives imageBase64 + obstacles[] (bounding boxes)
- *    → generates mask from bounding boxes, then calls Cloudflare AI
+ * Procedures:
  *
- * Called via: trpc.inpaint.cleanTerrain.mutate({ imageBase64, maskBase64?, obstacles? })
+ * 1. detectObstacles — uses Claude Vision (claude-opus-4-5) to analyze the
+ *    terrain photo and return ALL obstacles with precise bounding boxes.
+ *
+ * 2. cleanTerrain — two modes:
+ *    a. FREEHAND MASK: imageBase64 + maskBase64 (user-painted mask)
+ *    b. OBSTACLE LIST: imageBase64 + obstacles[] (bounding boxes)
+ *    Both call Cloudflare AI stable-diffusion-v1-5-inpainting.
  *
  * Cloudflare AI model: @cf/runwayml/stable-diffusion-v1-5-inpainting
  * Mask convention: WHITE = erase/inpaint, BLACK = keep
@@ -23,12 +25,16 @@ const CF_ACCOUNT_ID =
 const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
 const CF_INPAINT_URL = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/@cf/runwayml/stable-diffusion-v1-5-inpainting`;
 
+const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const CLAUDE_MODEL = "claude-opus-4-5";
+
 const ObstacleSchema = z.object({
   x: z.number(),
   y: z.number(),
   width: z.number(),
   height: z.number(),
   label: z.string(),
+  confidence: z.number().optional(),
 });
 
 /** Convert base64 data URL or raw base64 to Buffer */
@@ -103,23 +109,26 @@ function encodePng(width: number, height: number, rgbPixels: Uint8Array): Buffer
 /**
  * Create a grayscale mask PNG from obstacle bounding boxes.
  * White = inpaint, Black = keep.
- * Internal canvas coords: 800x600 → scaled to actual image dimensions.
+ * Coordinates are in actual image pixels (from Claude detection).
  */
 function createMaskFromObstacles(
   imageWidth: number,
   imageHeight: number,
-  obstacles: z.infer<typeof ObstacleSchema>[]
+  obstacles: z.infer<typeof ObstacleSchema>[],
+  coordSpace: "image" | "canvas800x600" = "image"
 ): Buffer {
   const pixels = new Uint8Array(imageWidth * imageHeight * 3).fill(0);
-  const scaleX = imageWidth / 800;
-  const scaleY = imageHeight / 600;
+  const scaleX = coordSpace === "canvas800x600" ? imageWidth / 800 : 1;
+  const scaleY = coordSpace === "canvas800x600" ? imageHeight / 600 : 1;
+
   for (const obs of obstacles) {
     const cx = obs.x * scaleX;
     const cy = obs.y * scaleY;
     const hw = (obs.width * scaleX) / 2;
     const hh = (obs.height * scaleY) / 2;
-    const padX = hw * 0.2;
-    const padY = hh * 0.2;
+    // Add 15% padding around each obstacle for clean edges
+    const padX = hw * 0.15;
+    const padY = hh * 0.15;
     const x0 = Math.max(0, Math.floor(cx - hw - padX));
     const y0 = Math.max(0, Math.floor(cy - hh - padY));
     const x1 = Math.min(imageWidth, Math.ceil(cx + hw + padX));
@@ -134,44 +143,147 @@ function createMaskFromObstacles(
   return encodePng(imageWidth, imageHeight, pixels);
 }
 
-/**
- * Resize a PNG/JPEG buffer to targetW x targetH using bilinear interpolation.
- * Returns a new PNG buffer.
- */
-function resizeImageBuffer(
-  srcBuf: Buffer,
-  srcW: number,
-  srcH: number,
-  targetW: number,
-  targetH: number,
-  channels: number = 3
-): Buffer {
-  // Decode PNG pixels (simplified — only handles uncompressed-like PNGs via raw scan)
-  // For production: use the raw pixel approach by re-encoding
-  // Since we only need to resize the mask (which we control), use nearest-neighbor
-  const srcPixels = new Uint8Array(srcW * srcH * channels);
-  const dstPixels = new Uint8Array(targetW * targetH * channels);
+export const inpaintRouter = router({
+  /**
+   * detectObstacles — analyze terrain photo with Claude Vision and return
+   * ALL detected obstacles with precise bounding boxes in image pixel coords.
+   */
+  detectObstacles: publicProcedure
+    .input(
+      z.object({
+        imageBase64: z.string(),
+        imageWidth: z.number().optional(),
+        imageHeight: z.number().optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const { imageBase64 } = input;
 
-  // We can't easily decode arbitrary PNG here without a library.
-  // Instead, return the original buffer if sizes match, or use the mask as-is.
-  // The Cloudflare API accepts mismatched sizes and will resize internally.
-  return srcBuf;
+      if (!CLAUDE_API_KEY) {
+        throw new Error("ANTHROPIC_API_KEY not configured on server");
+      }
+
+      const imgBuf = base64ToBuffer(imageBase64);
+      const { width: imgW, height: imgH } = getImageDimensions(imgBuf);
+      const imgRawB64 = imgBuf.toString("base64");
+
+      // Determine MIME type
+      const isPng = imgBuf[0] === 0x89 && imgBuf[1] === 0x50;
+      const mimeType = isPng ? "image/png" : "image/jpeg";
+
+      console.log(`[DetectObstacles] Analyzing ${imgW}x${imgH} image with Claude Vision...`);
+
+      const prompt = `You are analyzing a terrain/landscape photo (${imgW}x${imgH} pixels) to detect ALL obstacles that should be removed to prepare the land for landscaping.
+
+Detect EVERY obstacle including: rocks, stones, concrete blocks, debris, tree stumps, pipes, fences, posts, construction materials, or any man-made or natural object that does not belong to clean terrain.
+
+Return ONLY a valid JSON array with no markdown, no explanation, no code blocks. Each obstacle:
+{
+  "label": "rock",
+  "x": 85,
+  "y": 70,
+  "width": 70,
+  "height": 60,
+  "confidence": 0.95
 }
 
-export const inpaintRouter = router({
+Where x,y is the CENTER of the obstacle in pixels (relative to the ${imgW}x${imgH} image), width/height are the bounding box dimensions in pixels.
+
+If no obstacles are found, return an empty array: []`;
+
+      const claudePayload = {
+        model: CLAUDE_MODEL,
+        max_tokens: 2048,
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: mimeType,
+                  data: imgRawB64,
+                },
+              },
+              {
+                type: "text",
+                text: prompt,
+              },
+            ],
+          },
+        ],
+      };
+
+      const claudeResp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": CLAUDE_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(claudePayload),
+      });
+
+      if (!claudeResp.ok) {
+        const errText = await claudeResp.text();
+        console.error(`[DetectObstacles] Claude error ${claudeResp.status}: ${errText}`);
+        throw new Error(`Claude Vision error ${claudeResp.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const claudeData = await claudeResp.json() as any;
+      const responseText: string = claudeData?.content?.[0]?.text || "[]";
+
+      console.log(`[DetectObstacles] Claude raw response: ${responseText.slice(0, 200)}`);
+
+      // Extract JSON array from response (handle any extra text)
+      let obstacles: z.infer<typeof ObstacleSchema>[] = [];
+      try {
+        const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          obstacles = parsed.map((o: any) => ({
+            label: String(o.label || "obstacle"),
+            x: Number(o.x),
+            y: Number(o.y),
+            width: Number(o.width),
+            height: Number(o.height),
+            confidence: Number(o.confidence || 0.9),
+          })).filter((o: any) =>
+            !isNaN(o.x) && !isNaN(o.y) && !isNaN(o.width) && !isNaN(o.height) &&
+            o.width > 0 && o.height > 0
+          );
+        }
+      } catch (e) {
+        console.error(`[DetectObstacles] JSON parse error:`, e);
+        obstacles = [];
+      }
+
+      console.log(`[DetectObstacles] Found ${obstacles.length} obstacles`);
+      return {
+        obstacles,
+        imageWidth: imgW,
+        imageHeight: imgH,
+      };
+    }),
+
+  /**
+   * cleanTerrain — remove obstacles from terrain photo using Cloudflare AI inpainting.
+   * Accepts either a freehand mask (maskBase64) or obstacle bounding boxes (obstacles[]).
+   */
   cleanTerrain: publicProcedure
     .input(
       z.object({
         imageBase64: z.string(),
-        maskBase64: z.string().optional(),   // freehand painted mask from canvas
+        maskBase64: z.string().optional(),
         obstacles: z.array(ObstacleSchema).optional().default([]),
+        coordSpace: z.enum(["image", "canvas800x600"]).optional().default("image"),
         prompt: z.string().optional(),
       })
     )
     .mutation(async ({ input }) => {
-      const { imageBase64, maskBase64, obstacles, prompt } = input;
+      const { imageBase64, maskBase64, obstacles, coordSpace, prompt } = input;
 
-      // If no mask and no obstacles, return original
       if (!maskBase64 && (!obstacles || obstacles.length === 0)) {
         return { imageBase64 };
       }
@@ -182,18 +294,16 @@ export const inpaintRouter = router({
 
       const origBuffer = base64ToBuffer(imageBase64);
       const { width: origW, height: origH } = getImageDimensions(origBuffer);
-      console.log(`[Inpaint] Image: ${origW}x${origH}, mode: ${maskBase64 ? "freehand-mask" : "obstacle-list"}`);
+      console.log(`[Inpaint] Image: ${origW}x${origH}, mode: ${maskBase64 ? "freehand-mask" : `obstacle-list(${obstacles!.length})`}`);
 
       let maskBuffer: Buffer;
 
       if (maskBase64) {
-        // MODE 1: Freehand mask from canvas — use directly
         maskBuffer = base64ToBuffer(maskBase64);
         console.log(`[Inpaint] Using freehand mask (${maskBuffer.length} bytes)`);
       } else {
-        // MODE 2: Generate mask from obstacle bounding boxes
-        maskBuffer = createMaskFromObstacles(origW, origH, obstacles!);
-        console.log(`[Inpaint] Generated mask from ${obstacles!.length} obstacle(s)`);
+        maskBuffer = createMaskFromObstacles(origW, origH, obstacles!, coordSpace);
+        console.log(`[Inpaint] Generated mask from ${obstacles!.length} obstacle(s) in ${coordSpace} coords`);
       }
 
       const imageArray = Array.from(origBuffer);

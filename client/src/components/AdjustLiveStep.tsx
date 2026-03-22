@@ -42,7 +42,7 @@ import { useDesignSync } from "@/hooks/useDesignSync";
 import { useInventory } from "@/hooks/useInventory";
 import { DesignData, AdjustLiveData } from "@shared/workflow-persistence-types";
 import { AIDesignAssistant } from "./AIDesignAssistant";
-import { ObstacleDetector, Obstacle, runObstacleDetection } from "./ObstacleDetector";
+import { Obstacle } from "./ObstacleDetector";
 import { trpc } from "@/lib/trpc";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -148,8 +148,9 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
   // ─── Canvas drop zone ref ───
   const canvasContainerRef = useRef<HTMLDivElement>(null);
 
-  // ─── tRPC inpainting mutation ───
+  // ─── tRPC mutations ───
   const inpaintMutation = trpc.inpaint.cleanTerrain.useMutation();
+  const detectMutation = trpc.inpaint.detectObstacles.useMutation();
 
   const liveInteraction = useLiveInteraction();
   const designSync = useDesignSync(projectId, {
@@ -216,7 +217,7 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
     getInventoryItem,
   ]);
 
-  // ─── Detect obstacles ───
+  // ─── Detect obstacles via Claude Vision (backend) ───
   const handleDetect = useCallback(async () => {
     if (!backgroundImage) {
       setDetectionError("No se encontró la imagen del terreno.");
@@ -225,15 +226,32 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
     setIsDetecting(true);
     setDetectionError(null);
     try {
-      const result = await runObstacleDetection(backgroundImage, 800, 600);
-      setDetectedObstacles(result);
+      const result = await detectMutation.mutateAsync({
+        imageBase64: backgroundImage,
+      });
+      // Claude returns coords in actual image pixels.
+      // Map them to the 800x600 internal canvas coordinate space.
+      const { obstacles: rawObstacles, imageWidth, imageHeight } = result;
+      const scaleX = 800 / (imageWidth || 800);
+      const scaleY = 600 / (imageHeight || 600);
+      const mapped: Obstacle[] = rawObstacles.map((o, idx) => ({
+        id: `obs-${Date.now()}-${idx}`,
+        x: o.x * scaleX,
+        y: o.y * scaleY,
+        width: o.width * scaleX,
+        height: o.height * scaleY,
+        label: o.label,
+        confidence: o.confidence ?? 0.9,
+        type: "obstacle" as const,
+      }));
+      setDetectedObstacles(mapped);
       setShowObstacles(true);
     } catch (err: any) {
       setDetectionError(err.message || "Error al detectar obstáculos");
     } finally {
       setIsDetecting(false);
     }
-  }, [backgroundImage]);
+  }, [backgroundImage, detectMutation]);
 
   // ─── Remove obstacle (marker only) ───
   const handleObstacleRemove = useCallback((obstacleId: string) => {
@@ -265,6 +283,7 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
           obstacles: [obstacle].map((o) => ({
             x: o.x, y: o.y, width: o.width, height: o.height, label: o.label,
           })),
+          coordSpace: "canvas800x600",
         });
         const cleanedImage = result.imageBase64;
         // Update the background image with the cleaned version
@@ -317,6 +336,7 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
         obstacles: detectedObstacles.map((o) => ({
           x: o.x, y: o.y, width: o.width, height: o.height, label: o.label,
         })),
+        coordSpace: "canvas800x600",
       });
       const cleanedImage = result.imageBase64;
       setBackgroundImage(cleanedImage);
