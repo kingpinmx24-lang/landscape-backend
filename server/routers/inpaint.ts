@@ -26,7 +26,7 @@ const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
 const CF_INPAINT_URL = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/@cf/runwayml/stable-diffusion-v1-5-inpainting`;
 
 const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY || "";
-const CLAUDE_MODEL = "claude-opus-4-5";
+const CLAUDE_MODEL = "claude-opus-4-6";
 
 const ObstacleSchema = z.object({
   x: z.number(),
