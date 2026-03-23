@@ -2,8 +2,8 @@ services:
   - type: web
     name: landscape-backend
     runtime: node
-    buildCommand: pnpm install && pnpm run build:client && pnpm run build:server
-    startCommand: pnpm run start
+    buildCommand: pnpm install --prod --ignore-scripts
+    startCommand: node dist/index.js
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV

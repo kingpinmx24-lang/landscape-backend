@@ -3,7 +3,9 @@
 .pnpm-store/
 
 # Build outputs
-dist/
+dist/*.html
+dist/assets/
+dist/__manus__/
 build/
 *.dist
 
