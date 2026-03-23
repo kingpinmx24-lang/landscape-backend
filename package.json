@@ -13,7 +13,9 @@
     "check": "tsc --noEmit",
     "format": "prettier --write .",
     "test": "vitest run",
-    "db:push": "drizzle-kit generate && drizzle-kit migrate"
+    "db:push": "drizzle-kit generate && drizzle-kit migrate",
+    "build:serverless": "esbuild server/serverless-entry.ts --platform=node --packages=external --bundle --format=esm --outfile=dist/serverless.js",
+    "build:vercel": "pnpm run build:client && pnpm run build:serverless"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.693.0",
@@ -76,6 +78,7 @@
     "openai": "^6.32.0",
     "pg": "^8.12.0",
     "pngjs": "^7.0.0",
+    "postgres": "^3.4.8",
     "react": "^19.2.1",
     "react-day-picker": "^9.11.1",
     "react-dom": "^19.2.1",
@@ -101,8 +104,10 @@
     "@types/express": "4.17.21",
     "@types/google.maps": "^3.58.1",
     "@types/node": "^24.7.0",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.2.1",
     "@types/react-dom": "^19.2.1",
+    "@vercel/node": "^5.6.18",
     "@vitejs/plugin-react": "^5.0.4",
     "add": "^2.0.6",
     "autoprefixer": "^10.4.20",

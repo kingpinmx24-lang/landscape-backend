@@ -2,9 +2,11 @@
  * Router: Inventory
  * ============================================================================
  * Procedimientos tRPC para gestión de inventario y plantas
+ * NOTE: All procedures are PUBLIC — no auth required.
+ * This is a field sales app; the vendor uses their own device.
  */
 
-import { protectedProcedure, publicProcedure, router } from "../_core/trpc";
+import { publicProcedure, router } from "../_core/trpc";
 import { TRPCError } from "@trpc/server";
 import { z } from "zod";
 import { inventoryItems } from "../../drizzle/schema";
@@ -12,27 +14,46 @@ import { getDb } from "../db";
 import { eq } from "drizzle-orm";
 
 /**
- * Validación de planta
+ * Validación de planta — matches exact DB schema columns
  */
 const PlantSchema = z.object({
   name: z.string().min(1, "Name is required"),
-  scientificName: z.string().optional(),
-  type: z.enum(["tree", "shrub", "flower", "grass", "groundcover"]),
+  scientificName: z.string().optional().nullable(),
+  type: z.enum(["tree", "shrub", "flower", "grass", "groundcover", "palm", "succulent", "vine"]),
   price: z.number().positive("Price must be positive"),
-  stock: z.number().int().min(0, "Stock cannot be negative"),
-  minStock: z.number().int().min(0, "Min stock cannot be negative"),
-  imageUrl: z.string().url("Invalid image URL").optional(),
-  description: z.string().optional(),
-  climate: z.string().optional(),
-  lightRequirement: z.enum(["full", "partial", "shade"]).optional(),
-  waterRequirement: z.enum(["low", "medium", "high"]).optional(),
-  matureHeight: z.number().positive("Mature height must be positive").optional(),
-  matureWidth: z.number().positive("Mature width must be positive").optional(),
-  minSpacing: z.number().positive("Min spacing must be positive").optional(),
+  stock: z.number().int().min(0).default(0),
+  minStock: z.number().int().min(0).default(0),
+  imageUrl: z.string().optional().nullable(),
+  description: z.string().optional().nullable(),
+  lightRequirement: z.enum(["full", "partial", "shade"]).optional().nullable(),
+  waterRequirement: z.enum(["low", "medium", "high"]).optional().nullable(),
+  matureHeight: z.number().positive().optional().nullable(),
+  matureWidth: z.number().positive().optional().nullable(),
+  minSpacing: z.number().positive().optional().nullable(),
 });
 
+type PlantInput = z.infer<typeof PlantSchema>;
+
+function toDbValues(input: PlantInput) {
+  return {
+    name: input.name,
+    scientificName: input.scientificName ?? null,
+    type: input.type,
+    price: String(input.price), // decimal stored as string in drizzle
+    stock: input.stock ?? 0,
+    minStock: input.minStock ?? 0,
+    imageUrl: input.imageUrl ?? null,
+    description: input.description ?? null,
+    lightRequirement: input.lightRequirement ?? null,
+    waterRequirement: input.waterRequirement ?? null,
+    matureHeight: input.matureHeight ? String(input.matureHeight) : null,
+    matureWidth: input.matureWidth ? String(input.matureWidth) : null,
+    minSpacing: input.minSpacing ? String(input.minSpacing) : null,
+  };
+}
+
 /**
- * Router de inventario
+ * Router de inventario — todas las operaciones son públicas
  */
 export const inventoryRouter = router({
   list: publicProcedure.query(async () => {
@@ -43,26 +64,29 @@ export const inventoryRouter = router({
     return db.select().from(inventoryItems);
   }),
 
-  add: protectedProcedure.input(PlantSchema).mutation(async ({ input }) => {
+  add: publicProcedure.input(PlantSchema).mutation(async ({ input }) => {
     const db = await getDb();
     if (!db) {
       throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
     }
-    const [newPlant] = await db.insert(inventoryItems).values(input).returning();
+    const [newPlant] = await db.insert(inventoryItems).values(toDbValues(input)).returning();
     return newPlant;
   }),
 
-  update: protectedProcedure.input(PlantSchema.extend({ id: z.number() })).mutation(async ({ input }) => {
+  update: publicProcedure.input(PlantSchema.extend({ id: z.number() })).mutation(async ({ input }) => {
     const db = await getDb();
     if (!db) {
       throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
     }
     const { id, ...data } = input;
-    const [updatedPlant] = await db.update(inventoryItems).set(data).where(eq(inventoryItems.id, id)).returning();
+    const [updatedPlant] = await db.update(inventoryItems)
+      .set(toDbValues(data))
+      .where(eq(inventoryItems.id, id))
+      .returning();
     return updatedPlant;
   }),
 
-  delete: protectedProcedure.input(z.object({ id: z.number() })).mutation(async ({ input }) => {
+  delete: publicProcedure.input(z.object({ id: z.number() })).mutation(async ({ input }) => {
     const db = await getDb();
     if (!db) {
       throw new TRPCError({ code: "INTERNAL_SERVER_ERROR", message: "Database not available" });
@@ -71,7 +95,8 @@ export const inventoryRouter = router({
     return { success: true };
   }),
 
-  uploadImage: protectedProcedure.input(z.object({
+  // Upload image: receives base64, returns data URL
+  uploadImage: publicProcedure.input(z.object({
     fileData: z.string(), // Base64 encoded
     mimeType: z.string(),
   })).mutation(async ({ input }) => {
@@ -79,7 +104,7 @@ export const inventoryRouter = router({
     return { imageUrl };
   }),
 
-  updateStock: protectedProcedure.input(z.object({
+  updateStock: publicProcedure.input(z.object({
     id: z.number(),
     quantity: z.number(), // positive = add, negative = subtract
   })).mutation(async ({ input }) => {

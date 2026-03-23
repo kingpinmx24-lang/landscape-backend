@@ -43,7 +43,7 @@ export function useInventory() {
         type: item.type as PlantType,
         description: item.description || "",
         imageUrl: item.imageUrl || "https://via.placeholder.com/200?text=Plant",
-        price: item.price,
+        price: typeof item.price === 'string' ? parseFloat(item.price) : Number(item.price),
         stock: item.stock,
         minStock: item.minStock,
         climateZones: item.climate ? [item.climate as ClimateZone] : [],
@@ -321,10 +321,22 @@ export function useInventory() {
     getInventoryItem,
     updateStock,
 
-    // Mutaciones
-    addPlant: addPlantMutation.mutateAsync,
-    updatePlant: updatePlantMutation.mutateAsync,
-    deletePlant: deletePlantMutation.mutateAsync,
+    // Mutaciones con auto-refresh
+    addPlant: async (data: any) => {
+      const result = await addPlantMutation.mutateAsync(data);
+      await inventoryQuery.refetch();
+      return result;
+    },
+    updatePlant: async (data: any) => {
+      const result = await updatePlantMutation.mutateAsync(data);
+      await inventoryQuery.refetch();
+      return result;
+    },
+    deletePlant: async (data: any) => {
+      const result = await deletePlantMutation.mutateAsync(data);
+      await inventoryQuery.refetch();
+      return result;
+    },
     uploadImage: uploadImageMutation.mutateAsync,
   };
 }

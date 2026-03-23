@@ -27,10 +27,17 @@ function openDB(): Promise<IDBDatabase> {
 }
 
 /**
- * Save an image (base64 data URL) to IndexedDB.
- * Falls back to localStorage if IndexedDB is unavailable.
+ * Save an image (base64 data URL) to IndexedDB + sessionStorage + localStorage.
+ * Multiple layers ensure the image is always available.
  */
 export async function saveImage(key: string, dataUrl: string): Promise<void> {
+  // Layer 1: sessionStorage (fast, reliable within session, survives navigation)
+  try { sessionStorage.setItem(key, dataUrl); } catch {}
+
+  // Layer 2: localStorage (persists across sessions)
+  try { localStorage.setItem(key, dataUrl); } catch {}
+
+  // Layer 3: IndexedDB (primary, no size limit)
   try {
     const db = await openDB();
     await new Promise<void>((resolve, reject) => {
@@ -39,36 +46,21 @@ export async function saveImage(key: string, dataUrl: string): Promise<void> {
       const req = store.put(dataUrl, key);
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
     });
     db.close();
-    // Also store a flag in localStorage so we know the image exists in IDB
-    try { localStorage.setItem(`idb_flag_${key}`, "1"); } catch {}
   } catch (idbErr) {
-    console.warn("[imageStorage] IndexedDB failed, trying localStorage:", idbErr);
-    // Fallback: try localStorage with progressively smaller images
-    const sizes: Array<[number, number, number]> = [
-      [800, 600, 0.5],
-      [640, 480, 0.35],
-      [480, 360, 0.25],
-      [320, 240, 0.2],
-    ];
-    for (const [w, h, q] of sizes) {
-      try {
-        const small = await compressToSize(dataUrl, w, h, q);
-        localStorage.setItem(key, small);
-        return;
-      } catch {}
-    }
-    throw new Error("Cannot save image: storage quota exceeded on all attempts");
+    console.warn("[imageStorage] IndexedDB save failed (sessionStorage used as backup):", idbErr);
   }
 }
 
 /**
- * Load an image from IndexedDB (or localStorage fallback).
- * Returns undefined if not found.
+ * Load an image from IndexedDB → sessionStorage → localStorage.
+ * Returns undefined if not found in any layer.
  */
 export async function loadImage(key: string): Promise<string | undefined> {
-  // Try IndexedDB first
+  // Try IndexedDB first (primary)
   try {
     const db = await openDB();
     const result = await new Promise<string | undefined>((resolve, reject) => {
@@ -83,9 +75,16 @@ export async function loadImage(key: string): Promise<string | undefined> {
   } catch (idbErr) {
     console.warn("[imageStorage] IndexedDB read failed:", idbErr);
   }
+  // Fallback: sessionStorage (reliable within session)
+  try {
+    const ss = sessionStorage.getItem(key);
+    if (ss && ss.startsWith("data:")) return ss;
+  } catch {}
   // Fallback: localStorage
-  const ls = localStorage.getItem(key);
-  if (ls && ls.startsWith("data:")) return ls;
+  try {
+    const ls = localStorage.getItem(key);
+    if (ls && ls.startsWith("data:")) return ls;
+  } catch {}
   return undefined;
 }
 
@@ -102,6 +101,7 @@ export async function deleteImage(key: string): Promise<void> {
     });
     db.close();
   } catch {}
+  try { sessionStorage.removeItem(key); } catch {}
   try { localStorage.removeItem(key); } catch {}
   try { localStorage.removeItem(`idb_flag_${key}`); } catch {}
 }

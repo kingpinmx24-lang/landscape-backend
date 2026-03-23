@@ -31,7 +31,7 @@ import { CSVImporter } from "@/components/CSVImporter";
  * Permite agregar, editar, eliminar plantas y gestionar stock
  */
 export default function InventoryAdmin() {
-  const { inventory, loadInventory, updateStock } = useInventory();
+  const { inventory, loadInventory, updateStock, deletePlant } = useInventory();
   const [editingPlant, setEditingPlant] = useState<InventoryItem | null>(null);
   const [showAddForm, setShowAddForm] = useState(false);
   const [showImportCSV, setShowImportCSV] = useState(false);
@@ -47,12 +47,14 @@ export default function InventoryAdmin() {
       item.scientificName.toLowerCase().includes(searchTerm.toLowerCase())
   );
 
-  const handleDeletePlant = (id: string) => {
+  const handleDeletePlant = async (id: string) => {
     if (confirm("¿Estás seguro de que deseas eliminar esta planta?")) {
-      // En producción, sería: await trpc.inventory.delete.mutate(id)
-      const updatedInventory = inventory.filter((item) => item.id !== id);
-      localStorage.setItem("inventory", JSON.stringify(updatedInventory));
-      loadInventory();
+      try {
+        await deletePlant({ id: Number(id) });
+      } catch (err) {
+        console.error('Error deleting plant:', err);
+        alert('Error al eliminar la planta. Intenta de nuevo.');
+      }
     }
   };
 
@@ -102,7 +104,8 @@ export default function InventoryAdmin() {
     URL.revokeObjectURL(url);
   };
 
-  const totalValue = inventory.reduce((sum, item) => sum + item.price * item.stock, 0);
+  const toNum = (v: any) => typeof v === 'string' ? parseFloat(v) || 0 : Number(v) || 0;
+  const totalValue = inventory.reduce((sum, item) => sum + toNum(item.price) * item.stock, 0);
   const lowStockItems = inventory.filter((item) => item.stock < item.minStock);
   const outOfStockItems = inventory.filter((item) => item.stock === 0);
 
@@ -264,7 +267,7 @@ export default function InventoryAdmin() {
                           {item.type.charAt(0).toUpperCase() + item.type.slice(1)}
                         </Badge>
                       </TableCell>
-                      <TableCell>${item.price.toFixed(2)}</TableCell>
+                      <TableCell>${toNum(item.price).toFixed(2)}</TableCell>
                       <TableCell>
                         <Badge
                           variant={
@@ -279,7 +282,7 @@ export default function InventoryAdmin() {
                         </Badge>
                       </TableCell>
                       <TableCell>{item.minStock}</TableCell>
-                      <TableCell>${(item.price * item.stock).toFixed(2)}</TableCell>
+                      <TableCell>${(toNum(item.price) * item.stock).toFixed(2)}</TableCell>
                       <TableCell className="text-xs">{item.sunRequirement}</TableCell>
                       <TableCell className="text-xs">{item.waterNeeds}</TableCell>
                       <TableCell>

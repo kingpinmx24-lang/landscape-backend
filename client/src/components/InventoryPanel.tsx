@@ -199,9 +199,14 @@ export function InventoryPanel({
                       <div className="flex gap-3">
                         {/* Imagen */}
                         <img
-                          src={item.imageUrl}
+                          src={item.imageUrl && !item.imageUrl.includes('placeholder')
+                            ? item.imageUrl
+                            : `/plants/${item.type?.toLowerCase() || 'palm'}.png`}
                           alt={item.name}
-                          className="w-16 h-16 rounded object-cover"
+                          className="w-16 h-16 rounded object-cover bg-green-50"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).src = `/plants/palm.png`;
+                          }}
                         />
 
                         {/* Info */}
@@ -235,14 +240,24 @@ export function InventoryPanel({
                           draggable
                           onDragStart={(e) => {
                             e.dataTransfer.effectAllowed = "copy";
+                            // Build imageUrl: use DB value if real, else local PNG fallback
+                            const plantImageUrl = item.imageUrl && !item.imageUrl.includes('placeholder')
+                              ? item.imageUrl
+                              : `/plants/${item.type?.toLowerCase() || 'palm'}.png`;
                             e.dataTransfer.setData(
                               "application/json",
                               JSON.stringify({
                                 type: "plant",
+                                plantType: item.type || "plant",
                                 id: item.id,
-                                name: item.name,
-                                imageUrl: item.imageUrl,
-                                price: item.price,
+                                imageUrl: plantImageUrl,
+                                metadata: {
+                                  name: item.name,
+                                  scientificName: item.scientificName,
+                                  price: item.price,
+                                  inventoryItemId: item.id,
+                                  imageUrl: plantImageUrl,
+                                },
                               })
                             );
                             if (onDragPlant) {

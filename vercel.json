@@ -1,7 +1,13 @@
 {
   "version": 2,
+  "functions": {
+    "api/**/*.ts": {
+      "maxDuration": 60,
+      "memory": 1024
+    }
+  },
   "rewrites": [
-    { "source": "/api/(.*)", "destination": "https://landscape-backend.onrender.com/api/$1" },
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/api/(.*)", "destination": "/api/$1" },
+    { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]
 }

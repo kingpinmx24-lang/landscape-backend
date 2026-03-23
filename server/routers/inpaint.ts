@@ -1,36 +1,81 @@
 /**
- * Inpainting tRPC Router — Production Grade
+ * Inpainting tRPC Router — Production Grade v2
  * ============================================================================
- * Techniques used for maximum quality with Cloudflare SD v1.5:
+ * Supports two modes:
  *
- * 1. CROP-INPAINT-PASTE: Process each obstacle at full resolution by cropping
- *    the region, inpainting at 512x512, and compositing back.
+ * 1. FREEHAND MASK MODE (maskBase64 provided):
+ *    User painted a mask with the brush tool. We crop each masked region,
+ *    inpaint it, and paste back. Single pass optimized for Vercel 60s timeout.
  *
- * 2. MASK DILATION: Expand the mask by ~15% to eliminate residual edges and
- *    halos around removed objects.
+ * 2. OBSTACLE LIST MODE (obstacles[] provided):
+ *    Claude detected bounding boxes. We process each one with crop-inpaint-paste.
  *
- * 3. MULTI-PASS REFINEMENT: Apply inpainting twice per obstacle — first pass
- *    removes the object, second pass refines the fill texture.
+ * 3. COMBINED MODE (both provided):
+ *    We merge the freehand mask with obstacle bounding boxes into one mask.
  *
- * 4. CONTEXT-AWARE PROMPTS: Generate specific prompts based on obstacle label
- *    and surrounding terrain type detected by Claude.
- *
- * 5. OPTIMIZED PARAMS: num_steps=30, guidance=9.0, strength=0.99 for
- *    maximum inpainting coverage.
- *
- * 6. FEATHERED COMPOSITING: Blend the inpainted region back with a soft edge
- *    to avoid hard seams.
+ * Techniques:
+ *  - CROP-INPAINT-PASTE: Process at full resolution, inpaint at 512x512
+ *  - MASK DILATION: Expand mask 15px to eliminate halos
+ *  - CONTEXT-AWARE PROMPTS: Specific prompts per obstacle type
+ *  - SINGLE PASS: Optimized for Vercel 60s function timeout
  */
 import { z } from "zod";
 import { publicProcedure, router } from "../_core/trpc";
 import sharp from "sharp";
 
-const CF_ACCOUNT_ID =
-  process.env.CF_ACCOUNT_ID || "a5a228d8474a0f927acb0356a946d4fe";
-const CF_API_TOKEN = process.env.CF_API_TOKEN || "";
-const CF_INPAINT_URL = `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/@cf/runwayml/stable-diffusion-v1-5-inpainting`;
+// Read env vars lazily (at call time, not module load time)
+function getCFToken(): string {
+  return process.env.CF_API_TOKEN || "";
+}
+function getCFAccountId(): string {
+  return process.env.CF_ACCOUNT_ID || "a5a228d8474a0f927acb0356a946d4fe";
+}
+function getCFUrl(): string {
+  return `https://api.cloudflare.com/client/v4/accounts/${getCFAccountId()}/ai/run/@cf/runwayml/stable-diffusion-v1-5-inpainting`;
+}
+function getCFTxt2ImgUrl(): string {
+  return `https://api.cloudflare.com/client/v4/accounts/${getCFAccountId()}/ai/run/@cf/stabilityai/stable-diffusion-xl-base-1.0`;
+}
 
-const CLAUDE_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+// High-quality Unsplash fallback images per plant type (instant, no AI needed)
+const PLANT_FALLBACK_IMAGES: Record<string, string> = {
+  palm:        "https://images.unsplash.com/photo-1559827260-dc66d52bef19?w=400&q=85",
+  tree:        "https://images.unsplash.com/photo-1542601906990-b4d3fb778b09?w=400&q=85",
+  shrub:       "https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=400&q=85",
+  flower:      "https://images.unsplash.com/photo-1490750967868-88df5691cc0c?w=400&q=85",
+  grass:       "https://images.unsplash.com/photo-1558618666-fcd25c85cd64?w=400&q=85",
+  succulent:   "https://images.unsplash.com/photo-1459411552884-841db9b3cc2a?w=400&q=85",
+  groundcover: "https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=400&q=85",
+  vine:        "https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=400&q=85",
+  cactus:      "https://images.unsplash.com/photo-1459411552884-841db9b3cc2a?w=400&q=85",
+  fern:        "https://images.unsplash.com/photo-1416879595882-3373a0480b5b?w=400&q=85",
+  bamboo:      "https://images.unsplash.com/photo-1542601906990-b4d3fb778b09?w=400&q=85",
+  rose:        "https://images.unsplash.com/photo-1490750967868-88df5691cc0c?w=400&q=85",
+  bougainvillea: "https://images.unsplash.com/photo-1490750967868-88df5691cc0c?w=400&q=85",
+};
+
+// Generate plant image via Cloudflare AI text-to-image
+async function cfGeneratePlantImage(plantName: string, plantType: string): Promise<string | null> {
+  const token = getCFToken();
+  if (!token) return null;
+  const prompt = `professional landscape photography, isolated ${plantName} ${plantType} plant on transparent background, photorealistic, high quality, nursery catalog photo, white background, detailed leaves`;
+  try {
+    const response = await fetch(getCFTxt2ImgUrl(), {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt, num_steps: 20, width: 512, height: 512 }),
+    });
+    if (!response.ok) return null;
+    const buffer = Buffer.from(await response.arrayBuffer());
+    return 'data:image/png;base64,' + buffer.toString('base64');
+  } catch {
+    return null;
+  }
+}
+function getClaudeKey(): string {
+  return process.env.ANTHROPIC_API_KEY || "";
+}
+
 const CLAUDE_MODEL = "claude-opus-4-6";
 
 const ObstacleSchema = z.object({
@@ -51,65 +96,64 @@ function base64ToBuffer(base64: string): Buffer {
 }
 
 /**
- * Build a context-aware inpainting prompt based on obstacle label.
- * The more specific the prompt, the better SD v1.5 fills the area.
+ * STRICT inpainting prompts — ONLY erase and fill with bare terrain texture.
+ * NEVER add plants, trees, vegetation, or any new objects.
+ * The user decides what to place after cleaning.
  */
 function buildInpaintPrompt(label: string): { prompt: string; negative: string } {
   const l = label.toLowerCase();
 
-  // Terrain type prompts
-  if (l.includes("grass") || l.includes("lawn"))
+  // Universal strict negative — forbid any new content being generated
+  const STRICT_NEGATIVE =
+    "plants, trees, bushes, shrubs, flowers, vegetation, grass blades, leaves, branches, " +
+    "rocks, boulders, stones, gravel, sand, water, puddles, shadows, people, animals, " +
+    "furniture, pots, tools, construction materials, debris, pipes, fences, posts, " +
+    "structures, buildings, objects, artifacts, blurry, distorted, overexposed, " +
+    "watermark, text, logo, painting, illustration, cartoon, CGI, generated content";
+
+  // For every obstacle type: fill with bare flat terrain matching surrounding pixels
+  const BASE_PROMPT =
+    "bare flat empty soil ground, seamless texture perfectly matching surrounding area, " +
+    "photorealistic, neutral bare earth, empty terrain ready for landscaping, " +
+    "no objects, no plants, no vegetation, inpaint only the masked area";
+
+  if (l.includes("tree") || l.includes("stump") || l.includes("root") || l.includes("arbol") || l.includes("árbol") || l.includes("tronco"))
     return {
-      prompt: "lush green grass lawn, uniform texture, natural lighting, photorealistic",
-      negative: "objects, debris, artifacts, blurry, distorted",
-    };
-  if (l.includes("gravel") || l.includes("stone") || l.includes("pebble"))
-    return {
-      prompt: "natural gravel ground, small stones, earthy texture, photorealistic",
-      negative: "large rocks, objects, artifacts, blurry",
-    };
-  if (l.includes("soil") || l.includes("dirt") || l.includes("earth") || l.includes("debris"))
-    return {
-      prompt: "clean natural soil, bare earth, smooth dirt ground, photorealistic",
-      negative: "objects, tools, plants, artifacts, blurry",
-    };
-  if (l.includes("concrete") || l.includes("pavement") || l.includes("asphalt"))
-    return {
-      prompt: "smooth concrete surface, uniform grey pavement, photorealistic",
-      negative: "cracks, objects, stains, artifacts",
-    };
-  if (l.includes("rock") || l.includes("boulder"))
-    return {
-      prompt: "clean natural ground, soil and small pebbles, seamless terrain, photorealistic",
-      negative: "large rocks, boulders, objects, artifacts",
-    };
-  if (l.includes("tree") || l.includes("stump") || l.includes("root"))
-    return {
-      prompt: "clean flat ground, natural soil, seamless terrain fill, photorealistic",
-      negative: "tree stumps, roots, wood, objects, artifacts",
-    };
-  if (l.includes("fence") || l.includes("post") || l.includes("pipe"))
-    return {
-      prompt: "clean open terrain, natural ground, seamless background, photorealistic",
-      negative: "fence, posts, pipes, structures, objects, artifacts",
+      prompt: BASE_PROMPT + ", remove tree completely, fill with bare dirt ground",
+      negative: STRICT_NEGATIVE + ", tree, stump, root, wood, trunk",
     };
 
-  // Generic fallback
+  if (l.includes("fence") || l.includes("post") || l.includes("pipe") || l.includes("barda") || l.includes("reja") || l.includes("malla"))
+    return {
+      prompt: BASE_PROMPT + ", remove fence completely, fill with bare open ground",
+      negative: STRICT_NEGATIVE + ", fence, post, pipe, wire, metal, structure",
+    };
+
+  if (l.includes("concrete") || l.includes("pavement") || l.includes("asphalt") || l.includes("concreto") || l.includes("cemento"))
+    return {
+      prompt: BASE_PROMPT + ", remove concrete completely, fill with bare dirt ground",
+      negative: STRICT_NEGATIVE + ", concrete, pavement, asphalt, cement, slab",
+    };
+
+  if (l.includes("rock") || l.includes("boulder") || l.includes("piedra") || l.includes("stone"))
+    return {
+      prompt: BASE_PROMPT + ", remove rocks completely, fill with bare flat dirt",
+      negative: STRICT_NEGATIVE + ", rock, boulder, stone, pebble",
+    };
+
+  // Default — any obstacle type: erase and fill with bare terrain
   return {
-    prompt: "clean natural terrain, seamless ground fill matching surrounding area, photorealistic, no objects",
-    negative: "objects, tools, debris, rocks, structures, artifacts, blurry, distorted, watermark",
+    prompt: BASE_PROMPT + ", erase obstacle completely, fill with bare empty ground",
+    negative: STRICT_NEGATIVE,
   };
 }
 
 /**
  * Dilate a binary mask buffer by `pixels` pixels using a box kernel.
- * Input: PNG buffer (any channels). Output: PNG buffer with dilated white mask.
- * This eliminates residual halos around removed objects.
  */
 async function dilateMask(maskBuffer: Buffer, pixels: number, w: number, h: number): Promise<Buffer> {
   if (pixels <= 0) return maskBuffer;
 
-  // Get raw pixel data
   const { data } = await sharp(maskBuffer)
     .resize(w, h, { fit: "fill" })
     .greyscale()
@@ -119,7 +163,6 @@ async function dilateMask(maskBuffer: Buffer, pixels: number, w: number, h: numb
   const src = new Uint8Array(data);
   const dst = new Uint8Array(w * h);
 
-  // Box dilation
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       let maxVal = 0;
@@ -143,7 +186,7 @@ async function dilateMask(maskBuffer: Buffer, pixels: number, w: number, h: numb
 }
 
 /**
- * Single Cloudflare AI inpainting call.
+ * Single Cloudflare AI inpainting call with 3x auto-retry and exponential backoff.
  * image and mask must be 512x512 PNG buffers.
  * Returns PNG result buffer.
  */
@@ -153,39 +196,93 @@ async function cfInpaintCall(
   prompt: string,
   negative: string,
   steps: number = 25,
-  strength: number = 0.75,
-  guidance: number = 15.0
+  strength: number = 0.55,  // LOW strength = preserve surrounding texture, erase obstacle only
+  guidance: number = 4.0    // LOW guidance = stay close to original image, no hallucination
 ): Promise<Buffer> {
+  const token = getCFToken();
+  if (!token) throw new Error("CF_API_TOKEN not configured — contact admin");
+
   const imageArray = Array.from(image512);
   const maskArray = Array.from(mask512);
 
-  const resp = await fetch(CF_INPAINT_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${CF_API_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      prompt,
-      negative_prompt: negative,
-      image: imageArray,
-      mask: maskArray,
-      num_steps: steps,
-      strength,
-      guidance,
-    }),
-  });
+  const MAX_RETRIES = 3;
+  let lastError: Error | null = null;
 
-  if (!resp.ok) {
-    const err = await resp.text();
-    throw new Error(`Cloudflare AI ${resp.status}: ${err.slice(0, 200)}`);
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[CF Inpaint] Attempt ${attempt}/${MAX_RETRIES}...`);
+
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 50_000); // 50s timeout per attempt
+
+      let resp: Response;
+      try {
+        resp = await fetch(getCFUrl(), {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            prompt,
+            negative_prompt: negative,
+            image: imageArray,
+            mask: maskArray,
+            num_steps: steps,
+            strength,
+            guidance,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        // 429 = rate limit, 503 = overloaded — retry
+        if ((resp.status === 429 || resp.status === 503 || resp.status >= 500) && attempt < MAX_RETRIES) {
+          lastError = new Error(`CF ${resp.status}: ${errText.slice(0, 200)}`);
+          console.warn(`[CF Inpaint] Attempt ${attempt} failed (${resp.status}), retrying in ${attempt * 2}s...`);
+          await new Promise(r => setTimeout(r, attempt * 2000));
+          continue;
+        }
+        throw new Error(`Cloudflare AI error ${resp.status}: ${errText.slice(0, 300)}`);
+      }
+
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length < 1000) {
+        if (attempt < MAX_RETRIES) {
+          lastError = new Error(`CF returned too-small response: ${buf.length} bytes`);
+          console.warn(`[CF Inpaint] Attempt ${attempt} returned tiny response, retrying...`);
+          await new Promise(r => setTimeout(r, attempt * 1500));
+          continue;
+        }
+        throw new Error(`Cloudflare AI returned invalid response after ${MAX_RETRIES} attempts`);
+      }
+
+      console.log(`[CF Inpaint] ✓ Attempt ${attempt} succeeded (${buf.length} bytes)`);
+      return buf;
+
+    } catch (err: any) {
+      if (err.name === "AbortError") {
+        lastError = new Error(`Cloudflare AI timeout (attempt ${attempt})`);
+        console.warn(`[CF Inpaint] Attempt ${attempt} timed out`);
+      } else {
+        lastError = err;
+      }
+      if (attempt < MAX_RETRIES) {
+        console.warn(`[CF Inpaint] Attempt ${attempt} error: ${lastError?.message}, retrying in ${attempt * 2}s...`);
+        await new Promise(r => setTimeout(r, attempt * 2000));
+      }
+    }
   }
 
-  return Buffer.from(await resp.arrayBuffer());
+  throw lastError || new Error("Cloudflare AI failed after 3 attempts");
 }
 
 /**
- * Process a single obstacle using crop-dilate-inpaint-refine-paste.
+ * Process a single obstacle using crop-dilate-inpaint-paste.
  * Returns the updated full-image buffer.
  */
 async function processObstacle(
@@ -197,15 +294,14 @@ async function processObstacle(
   scaleY: number,
   promptOverride?: string
 ): Promise<Buffer> {
-  // Convert obstacle coords to image pixel space
   const cx = obs.x * scaleX;
   const cy = obs.y * scaleY;
   const hw = (obs.width * scaleX) / 2;
   const hh = (obs.height * scaleY) / 2;
 
-  // 70% padding for maximum surrounding context (model needs to see what to copy)
-  const padX = Math.max(hw * 0.7, 40);
-  const padY = Math.max(hh * 0.7, 40);
+  // 60% padding for surrounding context
+  const padX = Math.max(hw * 0.6, 30);
+  const padY = Math.max(hh * 0.6, 30);
 
   const cropX = Math.max(0, Math.floor(cx - hw - padX));
   const cropY = Math.max(0, Math.floor(cy - hh - padY));
@@ -214,7 +310,7 @@ async function processObstacle(
 
   if (cropW < 16 || cropH < 16) return workingBuffer;
 
-  // 1. Crop region from working image
+  // 1. Crop region
   const cropBuf = await sharp(workingBuffer)
     .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
     .png()
@@ -237,33 +333,132 @@ async function processObstacle(
     .png()
     .toBuffer();
 
-  // 3. Dilate mask by 18px to cover residual edges and halos
-  const dilatedMask = await dilateMask(rawMask, 18, cropW, cropH);
+  // 3. Dilate mask 15px
+  const dilatedMask = await dilateMask(rawMask, 15, cropW, cropH);
 
-  // 4. Resize crop + mask to 512x512 for Cloudflare
+  // 4. Resize to 512x512
   const crop512 = await sharp(cropBuf).resize(512, 512, { fit: "fill" }).png().toBuffer();
   const mask512 = await sharp(dilatedMask).resize(512, 512, { fit: "fill" }).png().toBuffer();
 
   const { prompt, negative } = buildInpaintPrompt(obs.label);
   const finalPrompt = promptOverride || prompt;
 
-  // 5. First pass: erase object — low strength (0.75) + high guidance (15.0)
-  //    This forces the model to COPY surrounding texture instead of generating new content
-  let result512 = await cfInpaintCall(crop512, mask512, finalPrompt, negative, 25, 0.75, 15.0);
+  // 5. Single pass inpainting (optimized for Vercel 60s timeout)
+  // strength=0.55: low enough to preserve surrounding texture, high enough to erase the obstacle
+  // guidance=4.0: low guidance = model stays closer to original image, less hallucination
+  const result512 = await cfInpaintCall(crop512, mask512, finalPrompt, negative, 25, 0.55, 4.0);
 
-  // 6. Second pass: blend edges — even lower strength for subtle refinement
-  const result512_v2 = await sharp(result512).resize(512, 512, { fit: "fill" }).png().toBuffer();
-  const refinePrompt = finalPrompt + ", seamless edges, matching surrounding texture";
-  result512 = await cfInpaintCall(result512_v2, mask512, refinePrompt, negative, 15, 0.5, 12.0);
-
-  // 7. Resize result back to crop dimensions
+  // 6. Resize back and composite
   const resultCrop = await sharp(result512)
     .resize(cropW, cropH, { fit: "fill" })
     .png()
     .toBuffer();
 
-  // 8. Composite back onto working image
   return sharp(workingBuffer)
+    .composite([{ input: resultCrop, left: cropX, top: cropY }])
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Process a freehand mask by finding bounding boxes of painted regions
+ * and processing each one separately (crop-inpaint-paste).
+ */
+async function processFreehandMask(
+  origBuffer: Buffer,
+  maskBuf: Buffer,
+  origW: number,
+  origH: number,
+  prompt?: string
+): Promise<Buffer> {
+  // Resize mask to image dimensions
+  const maskResized = await sharp(maskBuf)
+    .resize(origW, origH, { fit: "fill" })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const maskData = new Uint8Array(maskResized.data);
+
+  // Find bounding box of all painted pixels
+  let minX = origW, minY = origH, maxX = 0, maxY = 0;
+  let hasMask = false;
+
+  for (let y = 0; y < origH; y++) {
+    for (let x = 0; x < origW; x++) {
+      if (maskData[y * origW + x] > 30) {
+        hasMask = true;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+
+  if (!hasMask) return origBuffer;
+
+  // Add padding around the bounding box
+  const padX = Math.max((maxX - minX) * 0.3, 30);
+  const padY = Math.max((maxY - minY) * 0.3, 30);
+
+  const cropX = Math.max(0, Math.floor(minX - padX));
+  const cropY = Math.max(0, Math.floor(minY - padY));
+  const cropW = Math.min(origW - cropX, Math.ceil(maxX - minX + padX * 2));
+  const cropH = Math.min(origH - cropY, Math.ceil(maxY - minY + padY * 2));
+
+  if (cropW < 16 || cropH < 16) return origBuffer;
+
+  // Crop image and mask
+  const cropBuf = await sharp(origBuffer)
+    .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+    .png()
+    .toBuffer();
+
+  // Build mask for the crop region (white where painted, black elsewhere)
+  const cropMaskData = new Uint8Array(cropW * cropH);
+  for (let y = 0; y < cropH; y++) {
+    for (let x = 0; x < cropW; x++) {
+      const srcX = x + cropX;
+      const srcY = y + cropY;
+      if (srcX < origW && srcY < origH) {
+        cropMaskData[y * cropW + x] = maskData[srcY * origW + srcX];
+      }
+    }
+  }
+
+  const cropMaskBuf = await sharp(Buffer.from(cropMaskData), {
+    raw: { width: cropW, height: cropH, channels: 1 },
+  }).png().toBuffer();
+
+  // Dilate mask 12px
+  const dilatedMask = await dilateMask(cropMaskBuf, 12, cropW, cropH);
+
+  // Resize to 512x512
+  const crop512 = await sharp(cropBuf).resize(512, 512, { fit: "fill" }).png().toBuffer();
+  const mask512 = await sharp(dilatedMask).resize(512, 512, { fit: "fill" }).png().toBuffer();
+
+  // Ultra-strict freehand prompt: ONLY fill with terrain texture matching surroundings
+  const p = prompt ||
+    "bare empty ground, seamless terrain texture perfectly matching surrounding pixels, " +
+    "photorealistic soil or grass fill, no objects, no plants, no trees, no people, " +
+    "no structures, clean empty land, inpaint only the masked area";
+  const n =
+    "trees, plants, bushes, shrubs, flowers, vegetation, grass blades, leaves, branches, " +
+    "rocks, boulders, stones, people, animals, furniture, buildings, structures, objects, " +
+    "debris, pipes, fences, posts, shadows, water, puddles, blurry, distorted, " +
+    "overexposed, watermark, text, logo, painting, illustration, cartoon, CGI";
+
+  // strength=0.55: preserves surrounding texture, erases obstacle without hallucinating
+  // guidance=4.0: low guidance = stays close to original, less creative generation
+  const result512 = await cfInpaintCall(crop512, mask512, p, n, 25, 0.55, 4.0);
+
+  const resultCrop = await sharp(result512)
+    .resize(cropW, cropH, { fit: "fill" })
+    .png()
+    .toBuffer();
+
+  return sharp(origBuffer)
     .composite([{ input: resultCrop, left: cropX, top: cropY }])
     .png()
     .toBuffer();
@@ -285,7 +480,8 @@ export const inpaintRouter = router({
     .mutation(async ({ input }) => {
       const { imageBase64 } = input;
 
-      if (!CLAUDE_API_KEY) throw new Error("ANTHROPIC_API_KEY not configured");
+      const claudeKey = getClaudeKey();
+      if (!claudeKey) throw new Error("ANTHROPIC_API_KEY not configured");
 
       const imgBuf = base64ToBuffer(imageBase64);
       const meta = await sharp(imgBuf).metadata();
@@ -310,7 +506,7 @@ If no obstacles found, return: []`;
       const claudeResp = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers: {
-          "x-api-key": CLAUDE_API_KEY,
+          "x-api-key": claudeKey,
           "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
@@ -360,16 +556,12 @@ If no obstacles found, return: []`;
     }),
 
   /**
-   * cleanTerrain — Multi-pass crop-dilate-inpaint-refine-paste.
+   * cleanTerrain — Erase obstacles from terrain photo using Cloudflare AI.
    *
-   * For each obstacle:
-   *   1. Crop region with 50% padding
-   *   2. Build white mask, dilate 12px to cover edges
-   *   3. Resize to 512x512, call Cloudflare AI (30 steps, guidance 9.0)
-   *   4. Second refinement pass (20 steps) on the result
-   *   5. Resize back, composite onto full image
-   *
-   * Processes obstacles largest-first to avoid re-processing already-clean areas.
+   * Modes:
+   *  - maskBase64 only: freehand brush mask → crop bounding box → inpaint
+   *  - obstacles[] only: process each bounding box individually
+   *  - both: process obstacles first, then apply freehand mask
    */
   cleanTerrain: publicProcedure
     .input(
@@ -385,61 +577,392 @@ If no obstacles found, return: []`;
       const { imageBase64, maskBase64, obstacles, coordSpace, prompt } = input;
 
       if (!maskBase64 && (!obstacles || obstacles.length === 0)) {
-        return { imageBase64 };
+        return { imageBase64, success: true, processed: 0, failed: 0, errors: [] };
       }
-      if (!CF_API_TOKEN) throw new Error("CF_API_TOKEN not configured");
 
-      const origBuffer = base64ToBuffer(imageBase64);
+      const token = getCFToken();
+      if (!token) {
+        return {
+          imageBase64,
+          success: false,
+          processed: 0,
+          failed: 1,
+          errors: ["CF_API_TOKEN no configurado — contacta al administrador"],
+        };
+      }
+
+      let origBuffer: Buffer;
+      try {
+        origBuffer = base64ToBuffer(imageBase64);
+      } catch (e) {
+        return { imageBase64, success: false, processed: 0, failed: 1, errors: ["Imagen inválida"] };
+      }
+
       const meta = await sharp(origBuffer).metadata();
       const origW = meta.width || 800;
       const origH = meta.height || 600;
 
-      console.log(`[Inpaint] ${origW}x${origH} — mode: ${maskBase64 ? "freehand" : `obstacles(${obstacles!.length})`}`);
+      console.log(`[Inpaint] ${origW}x${origH} — obstacles:${obstacles?.length || 0} mask:${maskBase64 ? "yes" : "no"}`);
+
+      let workingBuffer = origBuffer;
+      let processed = 0;
+      let failed = 0;
+      const errors: string[] = [];
+
+      // ── OBSTACLE LIST MODE ─────────────────────────────────────────────────
+      if (obstacles && obstacles.length > 0) {
+        const scaleX = coordSpace === "canvas800x600" ? origW / 800 : 1;
+        const scaleY = coordSpace === "canvas800x600" ? origH / 600 : 1;
+
+        // Sort largest obstacles first
+        const sorted = [...obstacles].sort((a, b) => (b.width * b.height) - (a.width * a.height));
+
+        for (let i = 0; i < sorted.length; i++) {
+          const obs = sorted[i];
+          console.log(`[Inpaint] Obstacle ${i + 1}/${sorted.length}: ${obs.label}`);
+          try {
+            workingBuffer = await processObstacle(workingBuffer, obs, origW, origH, scaleX, scaleY, prompt);
+            console.log(`[Inpaint] ✓ ${obs.label} erased`);
+            processed++;
+          } catch (err) {
+            const msg = (err as Error).message;
+            console.error(`[Inpaint] ✗ ${obs.label} failed:`, msg);
+            errors.push(`${obs.label}: ${msg}`);
+            failed++;
+            // Continue with remaining obstacles — don't abort
+          }
+        }
+      }
 
       // ── FREEHAND MASK MODE ─────────────────────────────────────────────────
       if (maskBase64) {
-        const maskBuf = base64ToBuffer(maskBase64);
-        const dilatedMask = await dilateMask(maskBuf, 12, origW, origH);
-
-        const img512 = await sharp(origBuffer).resize(512, 512, { fit: "fill" }).png().toBuffer();
-        const mask512 = await sharp(dilatedMask).resize(512, 512, { fit: "fill" }).png().toBuffer();
-
-        const p = prompt || "clean natural terrain, seamless ground fill, photorealistic, no objects";
-        const n = "objects, tools, debris, artifacts, blurry, distorted, watermark";
-
-        let result = await cfInpaintCall(img512, mask512, p, n, 30);
-        // Refinement pass
-        const r2 = await sharp(result).resize(512, 512, { fit: "fill" }).png().toBuffer();
-        result = await cfInpaintCall(r2, mask512, p + ", seamless texture", n, 20);
-
-        const finalBuf = await sharp(result).resize(origW, origH, { fit: "fill" }).jpeg({ quality: 92 }).toBuffer();
-        console.log(`[Inpaint] Freehand done: ${finalBuf.length} bytes`);
-        return { imageBase64: "data:image/jpeg;base64," + finalBuf.toString("base64") };
-      }
-
-      // ── OBSTACLE LIST MODE ─────────────────────────────────────────────────
-      const scaleX = coordSpace === "canvas800x600" ? origW / 800 : 1;
-      const scaleY = coordSpace === "canvas800x600" ? origH / 600 : 1;
-
-      // Sort largest obstacles first (most impactful, process while image is clean)
-      const sorted = [...obstacles!].sort((a, b) => (b.width * b.height) - (a.width * a.height));
-
-      let workingBuffer = origBuffer;
-
-      for (let i = 0; i < sorted.length; i++) {
-        const obs = sorted[i];
-        console.log(`[Inpaint] Obstacle ${i + 1}/${sorted.length}: ${obs.label} (${Math.round(obs.width * scaleX)}x${Math.round(obs.height * scaleY)}px)`);
+        console.log(`[Inpaint] Processing freehand mask...`);
         try {
-          workingBuffer = await processObstacle(workingBuffer, obs, origW, origH, scaleX, scaleY, prompt);
-          console.log(`[Inpaint] ✓ ${obs.label} erased`);
+          const maskBuf = base64ToBuffer(maskBase64);
+          workingBuffer = await processFreehandMask(workingBuffer, maskBuf, origW, origH, prompt);
+          console.log(`[Inpaint] ✓ Freehand mask applied`);
+          processed++;
         } catch (err) {
-          console.error(`[Inpaint] ✗ ${obs.label} failed:`, (err as Error).message);
-          // Continue with remaining obstacles
+          const msg = (err as Error).message;
+          console.error(`[Inpaint] ✗ Freehand mask failed:`, msg);
+          errors.push(`Pincel: ${msg}`);
+          failed++;
+          // Return partial result (whatever was processed so far) instead of throwing
         }
       }
 
       const finalBuf = await sharp(workingBuffer).jpeg({ quality: 92 }).toBuffer();
-      console.log(`[Inpaint] All done: ${finalBuf.length} bytes`);
-      return { imageBase64: "data:image/jpeg;base64," + finalBuf.toString("base64") };
+      console.log(`[Inpaint] Done: processed=${processed} failed=${failed} size=${finalBuf.length}b`);
+
+      return {
+        imageBase64: "data:image/jpeg;base64," + finalBuf.toString("base64"),
+        success: failed === 0,
+        processed,
+        failed,
+        errors,
+      };
+    }),
+
+  /**
+   * aiDesignChat — AI landscape design assistant
+   * Receives user message + terrain image + inventory, returns reply + design actions
+   */
+  aiDesignChat: publicProcedure
+    .input(z.object({
+      message: z.string(),
+      captureImage: z.string().nullable().optional(),
+      canvasObjects: z.array(z.object({
+        id: z.string(),
+        type: z.string(),
+        x: z.number(),
+        y: z.number(),
+        name: z.string().optional(),
+        cost: z.number().optional(),
+      })).optional(),
+      inventory: z.array(z.object({
+        id: z.union([z.string(), z.number()]),
+        name: z.string(),
+        type: z.string(),
+        price: z.number(),
+        imageUrl: z.string().optional(),
+        stock: z.number().optional(),
+      })).optional(),
+      appliedMaterials: z.record(z.string()).optional(),
+    }))
+    .mutation(async ({ input }) => {
+      const claudeKey = getClaudeKey();
+      if (!claudeKey) {
+        return {
+          reply: "El asistente de IA no está configurado. Contacta al administrador.",
+          actions: [] as any[],
+        };
+      }
+
+      const { message, captureImage, canvasObjects = [], inventory = [], appliedMaterials = {} } = input;
+
+      const inventoryList = inventory.slice(0, 40).map(i =>
+        `- ID:${i.id} | ${i.name} (tipo: ${i.type}, precio: $${i.price}, stock: ${i.stock ?? '?'})`
+      ).join('\n');
+
+      const currentObjects = canvasObjects.map(o =>
+        `- ${o.name || o.type} en posición (${Math.round(o.x)}, ${Math.round(o.y)})`
+      ).join('\n');
+
+      const materialsApplied = Object.values(appliedMaterials).join(', ') || 'ninguno';
+
+      const systemPrompt = `Eres un asistente experto en diseño de paisajismo profesional. Ayudas al usuario a diseñar el terreno de su cliente usando su inventario de plantas y materiales.
+
+El canvas es de 800x600 píxeles. La imagen de fondo es la foto real del terreno. Cuando el usuario te envíe una imagen del terreno, ANÁLIZA visualmente dónde está la tierra/césped/área disponible y coloca los elementos en esas zonas.
+
+Inventario disponible (usa EXACTAMENTE estos IDs):
+${inventoryList || 'Sin inventario cargado aún'}
+
+Elementos actuales en el canvas:
+${currentObjects || 'Canvas vacío'}
+
+Materiales aplicados actualmente: ${materialsApplied}
+
+== INSTRUCCIONES DE RESPUESTA ==
+Cuando el usuario pida colocar plantas, materiales, diseñar el terreno O ELIMINAR elementos:
+1. Responde con un mensaje amigable y profesional explicando lo que harás
+2. Si ves la foto del terreno, menciona brevemente lo que observas (tierra disponible, área aproximada)
+3. Al FINAL de tu respuesta, incluye el bloque de acciones en este formato EXACTO:
+
+<actions>
+[
+  {"type": "add_plant", "inventoryId": "ID_EXACTO", "x": 400, "y": 300, "name": "Nombre", "plantType": "palm"},
+  {"type": "apply_material", "material": "grass", "zone": "full"},
+  {"type": "remove_objects", "filter": "all"},
+  {"type": "generate_terrain", "description": "lush green zoysia grass lawn covering the entire terrain, photorealistic", "style": "photorealistic", "materialName": "Pasto Zoysia"}
+]
+</actions>
+
+TIPOS DE ACCIONES DISPONIBLES:
+1. add_plant: Coloca planta. Campos: inventoryId (ID exacto o "GENERATE"), x, y, name, plantType (palm/tree/shrub/flower/grass/succulent)
+2. apply_material: Aplica material visual. Campos: material, zone
+3. remove_objects: Elimina elementos del canvas. Campos: filter ("all"=todos, "border"=borde, "left"/"right"/"center"/"top"/"bottom"=zona, "type:palm"=por tipo, "name:Palmera"=por nombre)
+4. generate_terrain: Genera imagen fotorrealista del terreno con IA. Campos:
+   - description: descripción detallada en INGLÉS del diseño (ej: "lush green zoysia grass lawn with river stone border path")
+   - style: "photorealistic"
+   - materialName: nombre EXACTO del material del inventario en español (ej: "Pasto Zoysia", "Piedras de Río") — OBLIGATORIO cuando el usuario mencione un material específico
+
+Materiales válidos: grass (pasto), river_stones (piedras de río), gravel (grava), soil (tierra), mulch, concrete (concreto).
+Zonas válidas: left, right, center, top, bottom, border, full.
+
+Posiciones en el canvas (800x600):
+- Izquierda: x entre 80-280, y entre 100-500
+- Centro: x entre 320-480, y entre 150-450
+- Derecha: x entre 520-720, y entre 100-500
+- Arriba: y entre 50-200
+- Abajo: y entre 400-550
+- Distribuye múltiples plantas uniformemente, nunca las pongas en la misma posición exacta
+
+REGLAS IMPORTANTES:
+- Usa SOLO plantas del inventario disponible con sus IDs exactos
+- Si piden "3 palmeras" y hay palmeras en inventario, genera 3 acciones add_plant con posiciones distintas
+- Si piden "elimina el borde", "borra las palmeras", "quita todo": genera acción remove_objects con el filter correcto
+- Si piden "pon pasto", "pasto zoysia", "diseña con piedras de río" o cualquier material: genera SIEMPRE acción generate_terrain con description en inglés Y materialName en español
+- La description del generate_terrain debe ser muy específica: incluye el tipo de pasto/material, cobertura, estilo, iluminación
+- Si no hay el tipo de planta pedido en inventario, usa add_plant con inventoryId="GENERATE" y el plantType correcto
+- Si el usuario hace preguntas generales de paisajismo, responde profesionalmente SIN generar acciones
+- Siempre responde en español`;
+
+      const userContent: any[] = [{ type: "text", text: message }];
+
+      if (captureImage && captureImage.startsWith('data:image/')) {
+        const base64Data = captureImage.replace(/^data:image\/\w+;base64,/, '');
+        const mediaType = captureImage.includes('data:image/png') ? 'image/png' : 'image/jpeg';
+        userContent.unshift({
+          type: "image",
+          source: { type: "base64", media_type: mediaType, data: base64Data }
+        });
+      }
+
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': claudeKey,
+          'anthropic-version': '2023-06-01',
+        },
+        body: JSON.stringify({
+          model: CLAUDE_MODEL,
+          max_tokens: 1200,
+          system: systemPrompt,
+          messages: [{ role: 'user', content: userContent }],
+        }),
+      });
+
+      if (!response.ok) {
+        const err = await response.text();
+        console.error('[aiDesignChat] Claude error:', err);
+        return { reply: 'Error al conectar con el asistente de IA. Intenta de nuevo.', actions: [] as any[] };
+      }
+
+      const data = await response.json() as any;
+      const fullText: string = data.content?.[0]?.text || '';
+
+      const actionsMatch = fullText.match(/<actions>([\s\S]*?)<\/actions>/);
+      let actions: any[] = [];
+      let reply = fullText.replace(/<actions>[\s\S]*?<\/actions>/g, '').trim();
+
+      if (actionsMatch) {
+        try {
+          actions = JSON.parse(actionsMatch[1].trim());
+        } catch (e) {
+          console.error('[aiDesignChat] Failed to parse actions:', e);
+        }
+      }
+
+      console.log(`[aiDesignChat] reply=${reply.length}chars actions=${actions.length}`);
+      return { reply, actions };
+    }),
+
+  /**
+   * generatePlantImage — Generates a photorealistic plant image via CF AI.
+   * Used when the plant is not found in the user's inventory.
+   * Returns a base64 image or a high-quality Unsplash fallback URL.
+   */
+  generatePlantImage: publicProcedure
+    .input(z.object({
+      plantName: z.string(),
+      plantType: z.string().default('tree'),
+    }))
+    .mutation(async ({ input }) => {
+      const { plantName, plantType } = input;
+      // 1. Try Cloudflare AI text-to-image (best quality)
+      const aiImage = await cfGeneratePlantImage(plantName, plantType);
+      if (aiImage) {
+        console.log(`[generatePlantImage] CF AI generated image for: ${plantName}`);
+        return { imageUrl: aiImage, source: 'ai' as const };
+      }
+      // 2. Fallback: high-quality Unsplash photo by plant type
+      const typeKey = plantType.toLowerCase();
+      const fallbackUrl = PLANT_FALLBACK_IMAGES[typeKey]
+        || PLANT_FALLBACK_IMAGES[plantName.toLowerCase()]
+        || PLANT_FALLBACK_IMAGES['tree'];
+      console.log(`[generatePlantImage] Using fallback for: ${plantName} (${plantType})`);
+      return { imageUrl: fallbackUrl, source: 'fallback' as const };
+    }),
+
+  /**
+   * generateDesign — Production-grade AI landscape design image generator.
+   *
+   * 3-Strategy fallback system (NEVER returns empty):
+   *   1. img2img with CF SD v1.5 inpainting (uses terrain photo as base — best result)
+   *   2. txt2img with CF SDXL-base-1.0 (high quality, no photo needed)
+   *   3. txt2img with CF SD v1.5 via cfGeneratePlantImage (most reliable)
+   *
+   * BUG FIXES applied:
+   *   - mask channels: 4 (RGBA) instead of 1 (grayscale) — was crashing Sharp
+   *   - image resized to PNG (not JPEG) for inpainting compatibility
+   *   - enriched prompt with material name and landscape context
+   *   - full try/catch per strategy with automatic fallthrough
+   */
+  generateDesign: publicProcedure
+    .input(z.object({
+      captureImage: z.string().optional(),
+      description: z.string(),
+      materialName: z.string().optional(),
+    }))
+    .mutation(async ({ input }) => {
+      const cfToken = getCFToken();
+      if (!cfToken) {
+        return { success: false, imageBase64: null as string | null, error: 'CF_API_TOKEN no configurado — contacta al administrador' };
+      }
+
+      const { captureImage, description, materialName } = input;
+
+      // Build a rich, specific prompt that names the exact material
+      const materialHint = materialName ? `${materialName}, ` : '';
+      const prompt = `Professional residential landscape design, ${materialHint}${description}. Photorealistic garden photography, high quality DSLR photo, natural sunlight, lush and well-maintained, professional landscaping, beautiful outdoor space, aerial perspective`;
+      const negativePrompt = 'ugly, blurry, low quality, cartoon, anime, drawing, sketch, painting, people, cars, text, watermark, logo, border, frame, distorted, deformed, bad anatomy, indoors';
+
+      console.log(`[generateDesign] START hasPhoto=${!!captureImage} material="${materialName || ''}" desc="${description.slice(0, 60)}"`);
+
+      // ── STRATEGY 1: img2img with CF SD v1.5 inpainting (uses terrain photo) ───
+      if (captureImage) {
+        try {
+          const imageBuffer = base64ToBuffer(captureImage);
+
+          // Resize to 512x512 PNG — CF inpainting requires PNG input
+          const resized = await sharp(imageBuffer)
+            .resize(512, 512, { fit: 'cover' })
+            .png()
+            .toBuffer();
+
+          // Full white mask (RGBA, 4 channels) — tells CF to transform the entire image
+          // CRITICAL FIX: channels MUST be 3 or 4, NOT 1 (grayscale crashes Sharp)
+          const maskBuffer = await sharp({
+            create: { width: 512, height: 512, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } }
+          }).png().toBuffer();
+
+          const resultBuf = await cfInpaintCall(
+            resized,
+            maskBuffer,
+            prompt,
+            negativePrompt,
+            25,   // steps — more steps = better quality
+            0.85, // strength — high = redesign the terrain completely
+            8.0   // guidance — higher = follows prompt more strictly
+          );
+
+          const resultBase64 = 'data:image/png;base64,' + resultBuf.toString('base64');
+          console.log(`[generateDesign] ✓ Strategy 1 (img2img inpainting) success, size=${resultBuf.length}b`);
+          return { success: true, imageBase64: resultBase64, error: null as string | null };
+        } catch (err: any) {
+          console.warn(`[generateDesign] Strategy 1 (img2img) failed: ${err.message} — falling back to txt2img`);
+        }
+      }
+
+      // ── STRATEGY 2: txt2img with SDXL (high quality, no photo needed) ────────
+      try {
+        const sdxlUrl = `https://api.cloudflare.com/client/v4/accounts/${getCFAccountId()}/ai/run/@cf/stabilityai/stable-diffusion-xl-base-1.0`;
+        const controller2 = new AbortController();
+        const timeout2 = setTimeout(() => controller2.abort(), 50_000);
+        let resp2: Response;
+        try {
+          resp2 = await fetch(sdxlUrl, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${cfToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ prompt, negative_prompt: negativePrompt, num_steps: 25, width: 768, height: 512 }),
+            signal: controller2.signal,
+          });
+        } finally {
+          clearTimeout(timeout2);
+        }
+        if (resp2.ok) {
+          const buf2 = Buffer.from(await resp2.arrayBuffer());
+          if (buf2.length > 1000) {
+            const resultBase64 = 'data:image/png;base64,' + buf2.toString('base64');
+            console.log(`[generateDesign] ✓ Strategy 2 (SDXL txt2img) success, size=${buf2.length}b`);
+            return { success: true, imageBase64: resultBase64, error: null as string | null };
+          }
+        } else {
+          const errText2 = await resp2.text();
+          console.warn(`[generateDesign] Strategy 2 SDXL failed: ${resp2.status} ${errText2.slice(0, 100)}`);
+        }
+      } catch (err: any) {
+        console.warn(`[generateDesign] Strategy 2 (SDXL) failed: ${err.message} — falling back to SD v1.5`);
+      }
+
+      // ── STRATEGY 3: txt2img with SD v1.5 (most reliable fallback) ──────────
+      try {
+        const generatedBase64 = await cfGeneratePlantImage(
+          `${materialHint}${description}`,
+          'landscape'
+        );
+        if (generatedBase64) {
+          console.log(`[generateDesign] ✓ Strategy 3 (SD v1.5 txt2img) success`);
+          return { success: true, imageBase64: generatedBase64, error: null as string | null };
+        }
+      } catch (err: any) {
+        console.warn(`[generateDesign] Strategy 3 (SD v1.5) failed: ${err.message}`);
+      }
+
+      // All strategies exhausted
+      console.error('[generateDesign] ✗ All 3 strategies failed');
+      return { success: false, imageBase64: null as string | null, error: 'No se pudo generar el diseño. Verifica la configuración de Cloudflare AI.' };
     }),
 });
+

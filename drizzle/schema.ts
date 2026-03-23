@@ -22,7 +22,7 @@ const quotationStatusEnum = pgEnum("quotation_status", [
   "rejected",
   "completed",
 ]);
-const plantTypeEnum = pgEnum("plant_type", ["tree", "shrub", "flower", "grass", "groundcover"]);
+const plantTypeEnum = pgEnum("plant_type", ["tree", "shrub", "flower", "grass", "groundcover", "palm", "succulent", "vine"]);
 const lightRequirementEnum = pgEnum("light_requirement", ["full", "partial", "shade"]);
 const waterRequirementEnum = pgEnum("water_requirement", ["low", "medium", "high"]);
 

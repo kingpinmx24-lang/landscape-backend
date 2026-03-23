@@ -8,10 +8,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { InventoryItem, PlantType, ClimateZone } from "@shared/inventory-types";
+import { InventoryItem, PlantType } from "@shared/inventory-types";
 import { useInventory } from "@/hooks/useInventory";
 import { trpc } from "@/lib/trpc";
 import { ImageUploader } from "./ImageUploader";
+import { Loader2 } from "lucide-react";
 
 interface AddPlantFormProps {
   initialData?: InventoryItem;
@@ -19,221 +20,253 @@ interface AddPlantFormProps {
   onSave: (plant: InventoryItem) => void;
 }
 
+// All plant types accepted by the server
+const PLANT_TYPES = [
+  { value: "tree",        label: "Árbol" },
+  { value: "shrub",       label: "Arbusto" },
+  { value: "flower",      label: "Flor / Planta de flor" },
+  { value: "grass",       label: "Pasto / Césped" },
+  { value: "groundcover", label: "Cubresuelo" },
+  { value: "palm",        label: "Palmera" },
+  { value: "succulent",   label: "Suculenta / Cactus" },
+  { value: "vine",        label: "Enredadera / Trepadora" },
+];
+
 /**
- * Formulario para agregar o editar una planta
+ * Formulario simplificado para agregar o editar una planta
+ * Solo campos esenciales — rápido de llenar en campo
  */
 export function AddPlantForm({ initialData, onClose, onSave }: AddPlantFormProps) {
-  const { addPlant, updatePlant, uploadImage } = useInventory();
+  const { addPlant, updatePlant } = useInventory();
   const uploadImageMutation = trpc.inventory.uploadImage.useMutation();
-  const [formData, setFormData] = useState<Partial<InventoryItem>>(
-    initialData || {
-      name: "",
-      scientificName: "",
-      type: PlantType.FLOWER,
-      description: "",
-      imageUrl: "",
-      price: 0,
-      stock: 0,
-      minStock: 0,
-      climateZones: [ClimateZone.TEMPERATE],
-      matureHeight: 0,
-      matureWidth: 0,
-      minSpacing: 0,
-      sunRequirement: "full",
-      waterNeeds: "medium",
-      maintenanceLevel: "medium",
-      nativeRegion: "",
-      isActive: true,
-    }
-  );
+
+  const [formData, setFormData] = useState({
+    name: initialData?.name || "",
+    scientificName: initialData?.scientificName || "",
+    type: (initialData?.type as string) || "tree",
+    description: initialData?.description || "",
+    imageUrl: initialData?.imageUrl || "",
+    price: initialData?.price || 0,
+    stock: initialData?.stock || 0,
+    minStock: initialData?.minStock || 0,
+    lightRequirement: (initialData as any)?.lightRequirement || "full",
+    waterRequirement: (initialData as any)?.waterRequirement || "medium",
+    matureHeight: (initialData as any)?.matureHeight || "",
+    matureWidth: (initialData as any)?.matureWidth || "",
+    minSpacing: (initialData as any)?.minSpacing || "",
+  });
 
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isUploadingImage, setIsUploadingImage] = useState(false);
 
   const handleChange = (field: string, value: any) => {
-    setFormData((prev) => ({
-      ...prev,
-      [field]: value,
-    }));
-    // Limpiar error del campo
+    setFormData(prev => ({ ...prev, [field]: value }));
     if (errors[field]) {
-      setErrors((prev) => {
-        const newErrors = { ...prev };
-        delete newErrors[field];
-        return newErrors;
-      });
+      setErrors(prev => { const n = { ...prev }; delete n[field]; return n; });
     }
   };
 
   const validateForm = (): boolean => {
     const newErrors: Record<string, string> = {};
-
     if (!formData.name?.trim()) newErrors.name = "El nombre es requerido";
-    if (!formData.scientificName?.trim()) newErrors.scientificName = "El nombre científico es requerido";
-    if (!formData.price || formData.price <= 0) newErrors.price = "El precio debe ser mayor a 0";
-    if (formData.stock === undefined || formData.stock < 0) newErrors.stock = "El stock no puede ser negativo";
-    if (!formData.matureHeight || formData.matureHeight <= 0) newErrors.matureHeight = "La altura debe ser mayor a 0";
-    if (!formData.matureWidth || formData.matureWidth <= 0) newErrors.matureWidth = "El ancho debe ser mayor a 0";
-    if (!formData.minSpacing || formData.minSpacing <= 0) newErrors.minSpacing = "El espaciamiento debe ser mayor a 0";
-
+    if (!formData.price || Number(formData.price) <= 0) newErrors.price = "El precio debe ser mayor a 0";
+    if (formData.stock === undefined || Number(formData.stock) < 0) newErrors.stock = "El stock no puede ser negativo";
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-
     if (!validateForm()) return;
+    setIsSubmitting(true);
 
-    const plantData = {
-      name: formData.name!,
-      scientificName: formData.scientificName || null,
-      type: formData.type as PlantType,
-      description: formData.description || null,
-      imageUrl: formData.imageUrl || null,
-      price: Number(formData.price) || 0,
-      stock: Number(formData.stock) || 0,
-      minStock: Number(formData.minStock) || 0,
-      climate: formData.climateZones?.[0] || null, // Assuming single climate zone for now
-      matureHeight: Number(formData.matureHeight) || null,
-      matureWidth: Number(formData.matureWidth) || null,
-      minSpacing: Number(formData.minSpacing) || null,
-      lightRequirement: (formData.sunRequirement as "full" | "partial" | "shade") || null,
-      waterRequirement: (formData.waterNeeds as "low" | "medium" | "high") || null,
-      maintenanceLevel: (formData.maintenanceLevel as "low" | "medium" | "high") || null,
-      nativeRegion: formData.nativeRegion || null,
-      // bloomSeason: formData.bloomSeason || null,
-      // bloomColor: formData.bloomColor || null,
-      // foliageColor: formData.foliageColor || null,
-      // isActive: formData.isActive !== false,
-    };
+    try {
+      // Only send fields that the server accepts
+      const plantData = {
+        name: formData.name.trim(),
+        scientificName: formData.scientificName?.trim() || null,
+        type: formData.type as any,
+        description: formData.description?.trim() || null,
+        imageUrl: formData.imageUrl || null,
+        price: Number(formData.price),
+        stock: Number(formData.stock) || 0,
+        minStock: Number(formData.minStock) || 0,
+        lightRequirement: (formData.lightRequirement as "full" | "partial" | "shade") || null,
+        waterRequirement: (formData.waterRequirement as "low" | "medium" | "high") || null,
+        matureHeight: formData.matureHeight ? Number(formData.matureHeight) : null,
+        matureWidth: formData.matureWidth ? Number(formData.matureWidth) : null,
+        minSpacing: formData.minSpacing ? Number(formData.minSpacing) : null,
+      };
 
-    let savedPlant: any;
-    if (initialData?.id) {
-      savedPlant = await updatePlant({ id: Number(initialData.id), ...(plantData as any) });
-    } else {
-      savedPlant = await addPlant(plantData as any);
+      let savedPlant: any;
+      if (initialData?.id) {
+        savedPlant = await updatePlant({ id: Number(initialData.id), ...(plantData as any) });
+      } else {
+        savedPlant = await addPlant(plantData as any);
+      }
+      onSave(savedPlant as InventoryItem);
+    } catch (err: any) {
+      console.error("Error saving plant:", err);
+      setErrors({ submit: err?.message || "Error al guardar la planta. Intenta de nuevo." });
+    } finally {
+      setIsSubmitting(false);
     }
-    onSave(savedPlant as InventoryItem);
   };
 
   return (
     <form onSubmit={handleSubmit} className="space-y-4">
+      {/* Error general */}
+      {errors.submit && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700">
+          {errors.submit}
+        </div>
+      )}
+
       {/* Nombre */}
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">
-          Nombre *
+          Nombre <span className="text-red-500">*</span>
         </label>
         <Input
-          value={formData.name || ""}
+          value={formData.name}
           onChange={(e) => handleChange("name", e.target.value)}
-          placeholder="Ej: Rosa"
+          placeholder="Ej: Palmera Real"
           className={errors.name ? "border-red-500" : ""}
+          disabled={isSubmitting}
         />
         {errors.name && <p className="text-xs text-red-500 mt-1">{errors.name}</p>}
       </div>
 
-      {/* Nombre Científico */}
+      {/* Nombre Científico (opcional) */}
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">
-          Nombre Científico *
+          Nombre Científico <span className="text-gray-400 text-xs">(opcional)</span>
         </label>
         <Input
-          value={formData.scientificName || ""}
+          value={formData.scientificName}
           onChange={(e) => handleChange("scientificName", e.target.value)}
-          placeholder="Ej: Rosa spp."
-          className={errors.scientificName ? "border-red-500" : ""}
+          placeholder="Ej: Roystonea regia"
+          disabled={isSubmitting}
         />
-        {errors.scientificName && <p className="text-xs text-red-500 mt-1">{errors.scientificName}</p>}
       </div>
 
       {/* Tipo */}
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">
-          Tipo
+          Tipo de Planta
         </label>
-        <Select value={formData.type || PlantType.FLOWER} onValueChange={(value) => handleChange("type", value)}>
+        <Select
+          value={formData.type}
+          onValueChange={(value) => handleChange("type", value)}
+          disabled={isSubmitting}
+        >
           <SelectTrigger>
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
-            {Object.values(PlantType).map((type) => (
-              <SelectItem key={type} value={type}>
-                {type.charAt(0).toUpperCase() + type.slice(1)}
+            {PLANT_TYPES.map((t) => (
+              <SelectItem key={t.value} value={t.value}>
+                {t.label}
               </SelectItem>
             ))}
           </SelectContent>
         </Select>
       </div>
 
-      {/* Descripción */}
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">
-          Descripción
-        </label>
-        <textarea
-          value={formData.description || ""}
-          onChange={(e) => handleChange("description", e.target.value)}
-          placeholder="Describe la planta..."
-          className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm"
-          rows={3}
-        />
-      </div>
-
-      {/* Carga de Imagen */}
+      {/* Imagen */}
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-2">
           Foto de la Planta
         </label>
         <ImageUploader
           onImageUpload={async (file) => {
-            if (file) {
+            if (!file) return;
+            setIsUploadingImage(true);
+            try {
               const reader = new FileReader();
               reader.readAsDataURL(file);
               reader.onloadend = async () => {
                 const base64data = reader.result?.toString().split(",")[1];
                 if (base64data) {
-                  const result = await uploadImage({ fileData: base64data, mimeType: file.type });
+                  const result = await uploadImageMutation.mutateAsync({
+                    fileData: base64data,
+                    mimeType: file.type,
+                  });
                   handleChange("imageUrl", result.imageUrl);
                 }
+                setIsUploadingImage(false);
               };
+            } catch (err) {
+              console.error("Image upload error:", err);
+              setIsUploadingImage(false);
             }
           }}
           maxSizeMB={20}
         />
-        {formData.imageUrl && (
-          <div className="mt-3 p-3 bg-blue-50 rounded-lg">
+        {isUploadingImage && (
+          <div className="mt-2 flex items-center gap-2 text-sm text-blue-600">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Subiendo imagen...
+          </div>
+        )}
+        {formData.imageUrl && !isUploadingImage && (
+          <div className="mt-3 flex items-center gap-3">
             <img
               src={formData.imageUrl}
               alt="Preview"
-              className="w-24 h-24 object-cover rounded-lg"
+              className="w-16 h-16 object-cover rounded-lg border border-gray-200"
             />
-            <p className="text-xs text-gray-600 mt-2">Imagen seleccionada</p>
+            <div>
+              <p className="text-xs text-green-600 font-medium">✓ Imagen cargada</p>
+              <button
+                type="button"
+                onClick={() => handleChange("imageUrl", "")}
+                className="text-xs text-red-500 hover:text-red-700 mt-0.5"
+              >
+                Quitar imagen
+              </button>
+            </div>
           </div>
         )}
       </div>
 
-      {/* Precio */}
+      {/* Descripción */}
       <div>
         <label className="block text-sm font-medium text-gray-700 mb-1">
-          Precio ($) *
+          Descripción <span className="text-gray-400 text-xs">(opcional)</span>
         </label>
-        <Input
-          type="number"
-          step="0.01"
-          min="0"
-          value={formData.price || ""}
-          onChange={(e) => handleChange("price", parseFloat(e.target.value))}
-          placeholder="0.00"
-          className={errors.price ? "border-red-500" : ""}
+        <textarea
+          value={formData.description}
+          onChange={(e) => handleChange("description", e.target.value)}
+          placeholder="Describe la planta, características, usos..."
+          className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-blue-500"
+          rows={2}
+          disabled={isSubmitting}
         />
-        {errors.price && <p className="text-xs text-red-500 mt-1">{errors.price}</p>}
       </div>
 
-      {/* Stock */}
-      <div className="grid grid-cols-2 gap-4">
+      {/* Precio y Stock */}
+      <div className="grid grid-cols-3 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Stock Disponible *
+            Precio ($) <span className="text-red-500">*</span>
+          </label>
+          <Input
+            type="number"
+            step="0.01"
+            min="0"
+            value={formData.price || ""}
+            onChange={(e) => handleChange("price", parseFloat(e.target.value))}
+            placeholder="0.00"
+            className={errors.price ? "border-red-500" : ""}
+            disabled={isSubmitting}
+          />
+          {errors.price && <p className="text-xs text-red-500 mt-1">{errors.price}</p>}
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">
+            Stock <span className="text-red-500">*</span>
           </label>
           <Input
             type="number"
@@ -242,12 +275,13 @@ export function AddPlantForm({ initialData, onClose, onSave }: AddPlantFormProps
             onChange={(e) => handleChange("stock", parseInt(e.target.value))}
             placeholder="0"
             className={errors.stock ? "border-red-500" : ""}
+            disabled={isSubmitting}
           />
           {errors.stock && <p className="text-xs text-red-500 mt-1">{errors.stock}</p>}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Stock Mínimo
+            Stock Mín.
           </label>
           <Input
             type="number"
@@ -255,127 +289,119 @@ export function AddPlantForm({ initialData, onClose, onSave }: AddPlantFormProps
             value={formData.minStock || ""}
             onChange={(e) => handleChange("minStock", parseInt(e.target.value))}
             placeholder="0"
+            disabled={isSubmitting}
           />
         </div>
       </div>
 
-      {/* Dimensiones */}
-      <div className="grid grid-cols-3 gap-4">
+      {/* Requerimientos */}
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Luz</label>
+          <Select
+            value={formData.lightRequirement}
+            onValueChange={(v) => handleChange("lightRequirement", v)}
+            disabled={isSubmitting}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="full">☀️ Sol pleno</SelectItem>
+              <SelectItem value="partial">⛅ Parcial</SelectItem>
+              <SelectItem value="shade">🌥️ Sombra</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Agua</label>
+          <Select
+            value={formData.waterRequirement}
+            onValueChange={(v) => handleChange("waterRequirement", v)}
+            disabled={isSubmitting}
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="low">💧 Baja</SelectItem>
+              <SelectItem value="medium">💧💧 Media</SelectItem>
+              <SelectItem value="high">💧💧💧 Alta</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      {/* Dimensiones (opcionales) */}
+      <div className="grid grid-cols-3 gap-3">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Altura Adulta (m) *
+            Altura (m)
           </label>
           <Input
             type="number"
             step="0.1"
             min="0"
             value={formData.matureHeight || ""}
-            onChange={(e) => handleChange("matureHeight", parseFloat(e.target.value))}
+            onChange={(e) => handleChange("matureHeight", e.target.value)}
             placeholder="0.0"
-            className={errors.matureHeight ? "border-red-500" : ""}
+            disabled={isSubmitting}
           />
-          {errors.matureHeight && <p className="text-xs text-red-500 mt-1">{errors.matureHeight}</p>}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Ancho Adulto (m) *
+            Ancho (m)
           </label>
           <Input
             type="number"
             step="0.1"
             min="0"
             value={formData.matureWidth || ""}
-            onChange={(e) => handleChange("matureWidth", parseFloat(e.target.value))}
+            onChange={(e) => handleChange("matureWidth", e.target.value)}
             placeholder="0.0"
-            className={errors.matureWidth ? "border-red-500" : ""}
+            disabled={isSubmitting}
           />
-          {errors.matureWidth && <p className="text-xs text-red-500 mt-1">{errors.matureWidth}</p>}
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">
-            Espaciamiento Mín. (m) *
+            Espaciado (m)
           </label>
           <Input
             type="number"
             step="0.1"
             min="0"
             value={formData.minSpacing || ""}
-            onChange={(e) => handleChange("minSpacing", parseFloat(e.target.value))}
+            onChange={(e) => handleChange("minSpacing", e.target.value)}
             placeholder="0.0"
-            className={errors.minSpacing ? "border-red-500" : ""}
+            disabled={isSubmitting}
           />
-          {errors.minSpacing && <p className="text-xs text-red-500 mt-1">{errors.minSpacing}</p>}
         </div>
-      </div>
-
-      {/* Requerimientos */}
-      <div className="grid grid-cols-3 gap-4">
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Luz
-          </label>
-          <Select value={formData.sunRequirement || "full"} onValueChange={(value) => handleChange("sunRequirement", value)}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="full">Sol pleno</SelectItem>
-              <SelectItem value="partial">Parcial</SelectItem>
-              <SelectItem value="shade">Sombra</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Agua
-          </label>
-          <Select value={formData.waterNeeds || "medium"} onValueChange={(value) => handleChange("waterNeeds", value)}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="low">Baja</SelectItem>
-              <SelectItem value="medium">Media</SelectItem>
-              <SelectItem value="high">Alta</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">
-            Mantenimiento
-          </label>
-          <Select value={formData.maintenanceLevel || "medium"} onValueChange={(value) => handleChange("maintenanceLevel", value)}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="low">Bajo</SelectItem>
-              <SelectItem value="medium">Medio</SelectItem>
-              <SelectItem value="high">Alto</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-      </div>
-
-      {/* Región Nativa */}
-      <div>
-        <label className="block text-sm font-medium text-gray-700 mb-1">
-          Región Nativa
-        </label>
-        <Input
-          value={formData.nativeRegion || ""}
-          onChange={(e) => handleChange("nativeRegion", e.target.value)}
-          placeholder="Ej: América del Norte"
-        />
       </div>
 
       {/* Botones */}
-      <div className="flex gap-2 pt-4">
-        <Button type="button" variant="outline" onClick={onClose} className="flex-1">
+      <div className="flex gap-3 pt-2">
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onClose}
+          className="flex-1"
+          disabled={isSubmitting}
+        >
           Cancelar
         </Button>
-        <Button type="submit" className="flex-1">
-          {initialData ? "Actualizar" : "Agregar"} Planta
+        <Button
+          type="submit"
+          className="flex-1 bg-green-600 hover:bg-green-700 text-white"
+          disabled={isSubmitting || isUploadingImage}
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 className="w-4 h-4 animate-spin mr-2" />
+              Guardando...
+            </>
+          ) : (
+            initialData ? "Actualizar Planta" : "Agregar Planta"
+          )}
         </Button>
       </div>
     </form>

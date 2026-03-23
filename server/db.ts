@@ -1,30 +1,31 @@
 import { eq } from "drizzle-orm";
-import { drizzle } from "drizzle-orm/node-postgres";
-import { Pool } from "pg";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
 import { InsertUser, users } from "../drizzle/schema";
 import { ENV } from "./_core/env";
 
 let _db: any = null;
-let _pool: any = null;
+let _sql: any = null;
 
 /**
  * Lazily create the drizzle instance so local tooling can run without a DB.
- * Uses pg driver for PostgreSQL connections.
+ * Uses postgres.js driver which has better SSL support for Render/serverless.
  */
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
-        ssl: {
-          rejectUnauthorized: false,
-        },
+      _sql = postgres(process.env.DATABASE_URL, {
+        ssl: { rejectUnauthorized: false },
+        connect_timeout: 15,
+        idle_timeout: 20,
+        max_lifetime: 60 * 30,
+        max: 3,
       });
-      _db = drizzle(_pool);
+      _db = drizzle(_sql);
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
-      _pool = null;
+      _sql = null;
     }
   }
   return _db;
@@ -34,9 +35,9 @@ export async function getDb() {
  * Close database connection (for cleanup)
  */
 export async function closeDb() {
-  if (_pool) {
-    await _pool.end();
-    _pool = null;
+  if (_sql) {
+    await _sql.end();
+    _sql = null;
     _db = null;
   }
 }
