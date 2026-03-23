@@ -1,5 +1,7 @@
 {
   "version": 2,
+  "buildCommand": "pnpm run build:vercel",
+  "outputDirectory": "dist",
   "functions": {
     "api/**/*.ts": {
       "maxDuration": 60,
