@@ -23,6 +23,7 @@ interface ImprovedLiveCanvasProps {
   onSelectionChange?: (selected: SelectedObject[]) => void;
   onObstacleDelete?: (obstacleId: string) => void;
   onInpaintMask?: (imageBase64: string, maskBase64: string) => Promise<string>;
+  onImageUpdated?: (newImageBase64: string) => void;
   gridSize?: number;
   snapToGrid?: boolean;
 }
@@ -35,6 +36,7 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
   onSelectionChange,
   onObstacleDelete,
   onInpaintMask,
+  onImageUpdated,
   gridSize = 20,
   snapToGrid = false,
 }) => {
@@ -129,7 +131,7 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
     if (!ctx) return;
     const { x, y } = getCanvasCoords(clientX, clientY);
     ctx.globalCompositeOperation = "source-over";
-    ctx.fillStyle = "white";
+    ctx.fillStyle = "rgba(255, 60, 60, 0.75)";
     ctx.beginPath();
     ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
     ctx.fill();
@@ -170,19 +172,53 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
       }
       const imageBase64 = bgCanvas.toDataURL("image/png");
 
-      // Get the mask as base64 (white = erase, black = keep)
-      // We need to create a proper black background + white strokes mask
+      // Get the mask as B&W base64 (white = erase, black = keep)
+      // The painted mask uses red strokes for visibility — convert to white for the API
       const maskCanvas2 = document.createElement("canvas");
       maskCanvas2.width = INTERNAL_W;
       maskCanvas2.height = INTERNAL_H;
       const maskCtx2 = maskCanvas2.getContext("2d");
       if (!maskCtx2) throw new Error("No mask context");
+      // Start with black background
       maskCtx2.fillStyle = "black";
       maskCtx2.fillRect(0, 0, INTERNAL_W, INTERNAL_H);
+      // Draw the painted mask (red strokes) on top
       maskCtx2.drawImage(mask, 0, 0);
+      // Convert any non-black pixel to white (handles red, white, or any color strokes)
+      const maskData = maskCtx2.getImageData(0, 0, INTERNAL_W, INTERNAL_H);
+      for (let i = 0; i < maskData.data.length; i += 4) {
+        const r = maskData.data[i];
+        const g = maskData.data[i + 1];
+        const b = maskData.data[i + 2];
+        const a = maskData.data[i + 3];
+        // If the pixel has any color (not pure black with full alpha), make it white
+        if (a > 10 && (r > 30 || g > 30 || b > 30)) {
+          maskData.data[i] = 255;
+          maskData.data[i + 1] = 255;
+          maskData.data[i + 2] = 255;
+          maskData.data[i + 3] = 255;
+        } else {
+          maskData.data[i] = 0;
+          maskData.data[i + 1] = 0;
+          maskData.data[i + 2] = 0;
+          maskData.data[i + 3] = 255;
+        }
+      }
+      maskCtx2.putImageData(maskData, 0, 0);
       const maskBase64 = maskCanvas2.toDataURL("image/png");
 
       const resultBase64 = await onInpaintMask(imageBase64, maskBase64);
+
+      // Apply the result image to the canvas immediately
+      if (resultBase64 && resultBase64.startsWith("data:")) {
+        const newImg = new Image();
+        newImg.onload = () => {
+          setBackgroundImg(newImg);
+        };
+        newImg.src = resultBase64;
+        // Notify parent so it can persist the new image
+        onImageUpdated?.(resultBase64);
+      }
 
       // Clear the mask after successful inpainting
       clearMask();
@@ -603,7 +639,7 @@ export const ImprovedLiveCanvas: React.FC<ImprovedLiveCanvasProps> = ({
         className="absolute top-0 left-0 w-full h-auto rounded-lg pointer-events-none"
         style={{
           opacity: eraserMode === "paint" ? 0.55 : 0,
-          mixBlendMode: "multiply",
+          mixBlendMode: "normal",
           display: "block",
         }}
       />

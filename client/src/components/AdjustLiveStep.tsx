@@ -44,7 +44,7 @@ import { DesignData, AdjustLiveData } from "@shared/workflow-persistence-types";
 import { AIDesignAssistant } from "./AIDesignAssistant";
 import { Obstacle } from "./ObstacleDetector";
 import { trpc } from "@/lib/trpc";
-import { saveImage } from "@/lib/imageStorage";
+import { saveImage, loadImage } from "@/lib/imageStorage";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -81,29 +81,18 @@ function useDeviceType(): "mobile" | "tablet" | "desktop" {
 
 // ─── Resolve capture image ───────────────────────────────────────────────────
 
-function resolveCaptureImage(
+function resolveCaptureImageSync(
   projectId: string,
   initialDesign: DesignData
 ): string {
-  if (initialDesign?.captureImage) return initialDesign.captureImage;
+  // Only check in-memory initialDesign — localStorage is no longer used for images
+  if (initialDesign?.captureImage && initialDesign.captureImage !== "__stored_separately__") {
+    return initialDesign.captureImage;
+  }
+  // Fallback: check localStorage (legacy, small images only)
   try {
     const stored = localStorage.getItem(`captureImage_${projectId}`);
-    if (stored) return stored;
-  } catch {}
-  try {
-    const designKey = Object.keys(localStorage).find(
-      (k) => k.startsWith("design_") && k.includes(projectId)
-    );
-    if (designKey) {
-      const data = JSON.parse(localStorage.getItem(designKey) || "{}");
-      if (data.captureImage) return data.captureImage;
-    }
-  } catch {}
-  try {
-    const projData = JSON.parse(
-      localStorage.getItem(`project_${projectId}`) || "{}"
-    );
-    if (projData.captureImage) return projData.captureImage;
+    if (stored && stored !== "__stored_separately__") return stored;
   } catch {}
   return "";
 }
@@ -128,11 +117,21 @@ export const AdjustLiveStep: React.FC<AdjustLiveStepProps> = ({
   const [showQuotation, setShowQuotation] = useState(true);
 
   // ─── Background image (can be updated by inpainting) ───
-  const originalCaptureImage = useMemo(
-    () => resolveCaptureImage(projectId, initialDesign),
+  const originalCaptureImageSync = useMemo(
+    () => resolveCaptureImageSync(projectId, initialDesign),
     [projectId, initialDesign]
   );
-  const [backgroundImage, setBackgroundImage] = useState(originalCaptureImage);
+  const [backgroundImage, setBackgroundImage] = useState(originalCaptureImageSync);
+
+  // Load image from IndexedDB asynchronously (iOS Safari stores images there)
+  useEffect(() => {
+    if (backgroundImage) return; // already loaded from sync source
+    loadImage(`captureImage_${projectId}`)
+      .then((img) => {
+        if (img) setBackgroundImage(img);
+      })
+      .catch(() => {});
+  }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Obstacle state ───
   const [detectedObstacles, setDetectedObstacles] = useState<Obstacle[]>([]);
