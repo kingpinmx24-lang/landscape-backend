@@ -152,7 +152,9 @@ async function cfInpaintCall(
   mask512: Buffer,
   prompt: string,
   negative: string,
-  steps: number = 30
+  steps: number = 25,
+  strength: number = 0.75,
+  guidance: number = 15.0
 ): Promise<Buffer> {
   const imageArray = Array.from(image512);
   const maskArray = Array.from(mask512);
@@ -169,8 +171,8 @@ async function cfInpaintCall(
       image: imageArray,
       mask: maskArray,
       num_steps: steps,
-      strength: 0.99,
-      guidance: 9.0,
+      strength,
+      guidance,
     }),
   });
 
@@ -201,9 +203,9 @@ async function processObstacle(
   const hw = (obs.width * scaleX) / 2;
   const hh = (obs.height * scaleY) / 2;
 
-  // 50% padding for better context
-  const padX = Math.max(hw * 0.5, 20);
-  const padY = Math.max(hh * 0.5, 20);
+  // 70% padding for maximum surrounding context (model needs to see what to copy)
+  const padX = Math.max(hw * 0.7, 40);
+  const padY = Math.max(hh * 0.7, 40);
 
   const cropX = Math.max(0, Math.floor(cx - hw - padX));
   const cropY = Math.max(0, Math.floor(cy - hh - padY));
@@ -235,8 +237,8 @@ async function processObstacle(
     .png()
     .toBuffer();
 
-  // 3. Dilate mask by 12px to cover residual edges
-  const dilatedMask = await dilateMask(rawMask, 12, cropW, cropH);
+  // 3. Dilate mask by 18px to cover residual edges and halos
+  const dilatedMask = await dilateMask(rawMask, 18, cropW, cropH);
 
   // 4. Resize crop + mask to 512x512 for Cloudflare
   const crop512 = await sharp(cropBuf).resize(512, 512, { fit: "fill" }).png().toBuffer();
@@ -245,13 +247,14 @@ async function processObstacle(
   const { prompt, negative } = buildInpaintPrompt(obs.label);
   const finalPrompt = promptOverride || prompt;
 
-  // 5. First pass: remove the object
-  let result512 = await cfInpaintCall(crop512, mask512, finalPrompt, negative, 30);
+  // 5. First pass: erase object — low strength (0.75) + high guidance (15.0)
+  //    This forces the model to COPY surrounding texture instead of generating new content
+  let result512 = await cfInpaintCall(crop512, mask512, finalPrompt, negative, 25, 0.75, 15.0);
 
-  // 6. Second pass: refine the fill (use result as new image, same mask)
+  // 6. Second pass: blend edges — even lower strength for subtle refinement
   const result512_v2 = await sharp(result512).resize(512, 512, { fit: "fill" }).png().toBuffer();
-  const refinePrompt = finalPrompt + ", seamless texture, no seams, photorealistic";
-  result512 = await cfInpaintCall(result512_v2, mask512, refinePrompt, negative, 20);
+  const refinePrompt = finalPrompt + ", seamless edges, matching surrounding texture";
+  result512 = await cfInpaintCall(result512_v2, mask512, refinePrompt, negative, 15, 0.5, 12.0);
 
   // 7. Resize result back to crop dimensions
   const resultCrop = await sharp(result512)
